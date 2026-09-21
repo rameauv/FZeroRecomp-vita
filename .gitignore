@@ -1,0 +1,77 @@
+.DS_Store
+__pycache__/
+.pytest_cache/
+
+# Local build output.
+/build*/
+
+# Recompiled ROM code. This is a derivative of F-Zero (USA).sfc and MUST NEVER
+# be committed: this repository is public. Regenerate it locally with
+# tools/regenerate.sh from your own legally obtained ROM.
+/generated/
+
+# Ghidra project (a disassembly of the ROM, so also a derivative) and the
+# session lock it writes beside it.
+/fzero-recomp.rep/
+/fzero-recomp.gpr
+/fzero-recomp.lock
+/fzero-recomp.lock~
+
+# Vita crash dumps. These are snapshots of live game memory, so they carry ROM
+# content as well as being pure runtime noise.
+/*.psp2dmp
+/*.psp2dmp.decompressed
+/psp2core-*
+
+# Local helper binaries and unrelated checkouts that happen to live in this
+# directory.
+/vita-crashdump*
+/sm64-vita/
+/FZeroRecomp-pc/
+/samples/
+/sdkDoc
+/debugnet/
+
+# Editor and agent scratch.
+/.cursor/
+/log.txt
+/docs/log.txt
+
+# Private inputs and runtime evidence. Never publish these.
+/reference/
+/saves/
+/captures/
+/screenshots/
+/evidence/
+/recordings/
+/replays/
+/traces/
+/workspaces/
+/project.txt
+/*.sfc
+/*.smc
+/*.fig
+/*.srm
+/*.srm.bak
+/*.state
+/*.jsonl
+*.sqlite
+*.sqlite-*
+*.mmo
+tier2_*.json
+
+# Vita3K emulator loop: a second build tree and the
+# log it copies back. Both are artifacts of a run, not source.
+build-vita3k/
+vita3k-log.txt
+
+# Planning notes stay local; only docs describing the shipped build are published.
+/docs/ADR/
+/docs/tickets/
+/docs/IMPLEMENTATION.md
+/HANDOFF.md
+/docs/GLOSSARY.md
+
+# Claude Code files (skills, settings, notes) stay local.
+/.claude/
+CLAUDE.md

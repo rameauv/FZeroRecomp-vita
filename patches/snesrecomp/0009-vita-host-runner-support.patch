@@ -1,0 +1,1674 @@
+Vita host runner support, squashed from 23 commits on top of da4a541:
+
+- Runner support for the PS Vita host
+- Trace $4200-$421F writes on the Vita host
+- Record LLE arrivals into the raster handler region
+- Record emulation-mode transitions on the Vita host
+- Also report an interpreter run that arrives in emulation mode
+- Treat page 0/1 execution as off the rails
+- Trip off-rails on leaving ROM, and report the stack leaving page 1
+- Offer a host write hook alongside the address write log
+- Widen RecompReturn so the LLE yield sentinel survives short enums
+- Add the diagnostics that located the truncated yield sentinel
+- Gate the bring-up diagnostics behind FZERO_DIAG
+- Vita: rasteriser phase timers, and an exact sprite-eval early-out
+- Hoist the widescreen-HUD test out of the compose loop
+- Measure APU catch-up cost; gate the per-scanline PPU probes
+- Split APU sync timing by call site
+- Run the APU on a second core, paced by guest cycles
+- PPU: compose palette table, Mode 7 render-VRAM hoist
+- PPU: a version counter on VRAM writes
+- PPU: record the winning OAM slot per pixel
+- PPU: per-column Mode 7 margin tiles, and a switch to skip the centre
+- PPU: count which register ports change between scanlines, and from where
+- PPU: oamCgramVersion, bumped by every guest OAM and CGRAM write
+- PPU: sprite limits count only what the hardware sees
+
+diff --git a/runner/runner.cmake b/runner/runner.cmake
+index 1835dba..6b5ccb9 100644
+--- a/runner/runner.cmake
++++ b/runner/runner.cmake
+@@ -168,6 +168,7 @@ set(SNESRECOMP_RUNNER_SOURCES
+     ${SNESRECOMP_RUNNER_ROOT}/src/common_cpu_infra.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/common_rtl.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/widescreen.c
++    ${SNESRECOMP_RUNNER_ROOT}/src/vita_getenv.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/recomp_hw.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/framedump.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/host_paths.c
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index 5888d1d..e470f44 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -1,3 +1,21 @@
++#if defined(__vita__)
++#include <psp2/kernel/processmgr.h>
++/* APU catch-up cost. PC sampling puts ~27% of all work in the APU against the
++ * PPU's ~64%, with recompiled guest code at 1.2% -- so cpu= is mostly this,
++ * not the recompiler. Measured here rather than inferred. ~268 calls/frame,
++ * so two timer reads each is ~360 us/frame; reported as apuprobe=. */
++uint64_t g_apuprof_us; uint32_t g_apuprof_calls;
++uint64_t g_apuprof_port_us, g_apuprof_frame_us;
++uint32_t g_apuprof_port_calls, g_apuprof_frame_calls;
++#define APU_T0 uint64_t _apu_t = sceKernelGetProcessTimeWide()
++#define APU_ACC(site_us, site_calls) do { \
++    uint64_t _d = sceKernelGetProcessTimeWide() - _apu_t; \
++    g_apuprof_us += _d; g_apuprof_calls++; \
++    (site_us) += _d; (site_calls)++; } while (0)
++#else
++#define APU_T0 do { } while (0)
++#define APU_ACC(a,b) do { (void)0; } while (0)
++#endif
+ #include "common_rtl.h"
+ #include "apu_frame_clock.h"
+ #include "common_cpu_infra.h"
+@@ -216,6 +234,11 @@ static uint64_t g_apu_frame_start_master;
+ static RtlApuFrameClock g_apu_frame_clock;
+ static bool g_extended_frame_timing;
+ static bool g_apu_frame_time_valid;
++/* APU worker opt-in. Declared here rather than beside the rest of the worker
++ * state below because rtl_apu_pace_check, further up the file, has to consult
++ * it. Written only under RtlApuLock (RtlApuWorkerEnable); the reads are plain
++ * int loads of a value that changes at most once per A/B block. */
++static int g_rtl_apu_worker = 0;
+ 
+ bool rtl_apu_frame_timeline_active(void) {
+   return g_apu_frame_time_valid;
+@@ -1400,6 +1423,12 @@ void WriteReg(uint16 reg, uint8 value) {
+     cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+     cart_write(g_snes->cart, 0, reg, value);
+   } else if (reg >= 0x2100 && reg < 0x2140) {
++#if defined(VITA) && FZERO_DIAG
++    /* Vita bring-up probe: trace the display registers that decide whether a
++     * frame can show anything (INIDISP brightness / forced blank, TM/TS). */
++    { extern void FZeroLogPpuRegWrite(uint16 reg, uint8 value, int line);
++      FZeroLogPpuRegWrite(reg, value, g_snes ? (int)g_snes->vPos : -1); }
++#endif
+     ppu_write(g_ppu, reg & 0xff, value);
+     if (g_snes)
+       ppu_rasterRecord(reg, g_snes->vPos, value);
+@@ -1414,6 +1443,13 @@ void WriteReg(uint16 reg, uint8 value) {
+   } else if (reg >= 0x2180 && reg < 0x2184) {
+     snes_writeBBus(g_snes, reg & 0xff, value);
+   } else if (reg >= 0x4200 && reg < 0x4220) {
++#if defined(VITA) && FZERO_DIAG
++    /* Vita bring-up probe: the raster split chain is armed through $4200
++     * (NMI/IRQ enable) and $4207-$420A (H/V timer targets). Trace those to
++     * see whether the chain is armed at all, and at which line. */
++    { extern void FZeroLogCpuRegWrite(uint16 reg, uint8 value, int line);
++      FZeroLogCpuRegWrite(reg, value, g_snes ? (int)g_snes->vPos : -1); }
++#endif
+     if (reg == 0x420C) {
+       g_snesrecomp_last_hdmaen = value;
+       /* Per-line fact: this title switches the transition's HDMA
+@@ -1529,6 +1565,7 @@ uint16 ReadRegWord(uint16 reg) {
+ static void WriteVramWord(Ppu *ppu, uint16 value) {
+   uint16_t adr = ppu->vramPointer;
+   ppu->vram[adr & 0x7fff] = value;
++  ppu->vramVersion++;
+   // Atomic 16-bit STA $2118 hits both VRAM bytes at this word; record
+   // each as a byte event so the differ can compare against the
+   // oracle's REGISTER_2118 + REGISTER_2119 byte sequence.
+@@ -1763,6 +1800,9 @@ void RtlApuWrite(uint16 adr, uint8 val) {
+ uint64_t apus_prof_calls = 0;
+ double apus_prof_ms = 0.0;
+ #endif
++uint64_t rtl_apu_guest_cycle_probe(void) { return rtl_apu_guest_cycle(); }
++uint64_t rtl_apu_frame_start_probe(void) { return g_apu_frame_start_master; }
++
+ void rtl_sync_apu_to_cpu_locked(void) {
+ #ifdef SNESRECOMP_INTERP_PROFILE
+   { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
+@@ -1781,8 +1821,10 @@ void rtl_sync_apu_to_cpu_locked(void) {
+   }
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
+   uint64_t before = g_snes->apu->portClock;
++  APU_T0;
+   bool synced = apu_runToGuestCycle(g_snes->apu, rtl_apu_guest_cycle(),
+                                     1u << 20);
++  APU_ACC(g_apuprof_port_us, g_apuprof_port_calls);
+   audio_trace_on_guest_sync(0, g_snes->apu->portClock - before);
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+   if (!synced)
+@@ -1808,6 +1850,11 @@ void rtl_apu_pace_check(void) {
+    * blocks disturbs that pacing and can stall the vblank poll loop. Only
+    * pace once real frames are running. */
+   if (snes_frame_counter == 0) return;
++  /* Pacing exists so a long AOT block cannot leave the SPC frozen. With a
++   * worker advancing it continuously on another core there is nothing to
++   * unfreeze, and advancing here would both do the work on the wrong core
++   * and push the SPC past the frame ceiling the worker is bounded by. */
++  if (g_rtl_apu_worker) return;
+   uint64_t delta = g_cpu.master_cycles - g_apu_last_sync_master;
+   if (delta < 1024) return;
+   RtlApuLock();
+@@ -1960,6 +2007,74 @@ void rtl_apu_perf_snapshot(uint64_t *ns, uint64_t *calls) {
+     if (calls) *calls = s_apu_boundary_calls;
+ }
+ 
++/* ======================================================================
++ * APU worker (second core). See the contract in common_rtl.h and
++ * HANDOFF.md section 10.
++ *
++ * Every variable below, and g_rtl_apu_worker declared further up, is read and
++ * written ONLY under RtlApuLock. That is deliberate on a 32-bit weakly-ordered
++ * core: g_apu_worker_target is
++ * uint64_t, so an unlocked load is two 32-bit accesses and can tear, and the
++ * lock supplies the release/acquire pair that makes the queued port writes
++ * published before it visible to the other core. The cost is one acquisition
++ * per side per frame plus one per worker slice.
++ * ====================================================================== */
++static uint64_t g_apu_worker_target = 0;/* guest-cycle ceiling, frame ends only */
++static int      g_apu_worker_busy = 0;  /* ceiling not yet reached */
++static uint64_t g_apu_worker_slices = 0;/* slices executed                    */
++static uint64_t g_apu_worker_idle = 0;  /* polls that found the ceiling reached */
++static uint64_t g_apu_worker_late = 0;  /* publishes that found it still behind */
++
++void RtlApuWorkerEnable(int on) {
++  RtlApuLock();
++  g_rtl_apu_worker = on ? 1 : 0;
++  RtlApuUnlock();
++}
++
++int rtl_apu_worker_active(void) { return g_rtl_apu_worker; }
++
++int rtl_apu_worker_slice(uint32_t max_cycles) {
++  RtlApuLock();
++  if (!g_apu_worker_busy) {
++    g_apu_worker_idle++;
++    RtlApuUnlock();
++    return 0;
++  }
++  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
++  uint64_t before = g_snes->apu->portClock;
++  /* max_cycles exhausted => returns false with the ceiling unchanged, so
++   * re-entering resumes exactly where this slice stopped. No APU-side state
++   * is needed to make the advance resumable. */
++  bool reached = apu_runToGuestCycle(g_snes->apu, g_apu_worker_target,
++                                     max_cycles);
++  audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
++  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
++  g_apu_worker_slices++;
++  if (reached) g_apu_worker_busy = 0;
++  RtlApuUnlock();
++  return reached ? 0 : 1;
++}
++
++void rtl_apu_worker_stats(uint64_t *slices, uint64_t *idle, uint64_t *late) {
++  RtlApuLock();
++  if (slices) *slices = g_apu_worker_slices;
++  if (idle)   *idle   = g_apu_worker_idle;
++  if (late)   *late   = g_apu_worker_late;
++  RtlApuUnlock();
++}
++
++/* Hand the worker the frame just completed. Caller: game thread, once per
++ * frame, holding RtlApuLock. If the previous ceiling has not been reached the
++ * worker is behind real time -- that is the health metric to watch, not a
++ * correctness problem:
++ * raising the ceiling while it is still walking toward the old one is the
++ * same monotone sequence of targets, just later in host time. */
++static void rtl_apu_worker_publish_locked(uint64_t boundary) {
++  if (g_apu_worker_busy) g_apu_worker_late++;
++  if (boundary > g_apu_worker_target) g_apu_worker_target = boundary;
++  g_apu_worker_busy = 1;
++}
++
+ #ifdef SNESRECOMP_INTERP_PROFILE
+ #include <time.h>
+ uint64_t apub_prof_calls = 0;
+@@ -1990,8 +2105,18 @@ static void rtl_sync_apu_frame_boundary(void) {
+   uint64_t boundary = g_extended_frame_timing
+       ? rtl_apu_clock_finish(&g_apu_frame_clock, g_cpu.master_cycles)
+       : (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME;
+-  bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
+-                                    1u << 20);
++  APU_T0;
++  bool synced = true;
++  if (g_rtl_apu_worker) {
++    /* The worker owns advancement. Publishing is the whole of the game
++     * thread's APU work for this frame; the lock this function already holds
++     * is the one the contract requires, so publish inline rather than relying
++     * on the host mutex being recursive. */
++    rtl_apu_worker_publish_locked(boundary);
++  } else {
++    synced = apu_runToGuestCycle(g_snes->apu, boundary, 1u << 20);
++  }
++  APU_ACC(g_apuprof_frame_us, g_apuprof_frame_calls);
+   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+   if (!synced)
+@@ -2103,6 +2228,12 @@ static double s_render_phase;      /* fractional native position, carried over *
+ static int16 s_render_hold_l;      /* last native delivered — fade anchor and  */
+ static int16 s_render_hold_r;      /* interpolation partner across calls       */
+ static int s_render_starved;       /* in a starvation episode (drives fade-in) */
++/* Starvation episodes and the frames lost to them, since boot. The APU worker
++ * runs the DSP a frame behind, so "is the ring deep enough" stopped being a
++ * question the target constant answers on its own -- this counts what
++ * actually happened instead of inferring it from an occupancy snapshot.
++ * Written only inside the render callback; read for logging. */
++uint64_t g_rtl_audio_starve_episodes = 0, g_rtl_audio_starve_frames = 0;
+ static int s_render_fade_pos;      /* fade-in progress, carried across calls   */
+ static double s_render_occ_ema = -1.0; /* burst-filtered occupancy, -1 = unset */
+ /* Host output rate. Defaults to the native rate, so a host that never calls
+@@ -2216,6 +2347,8 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
+   if (usable < frames) {
+     /* Fade the tail to silence over the remaining frames (capped) instead of
+      * cutting, then hold silence. */
++    if (!s_render_starved) g_rtl_audio_starve_episodes++;
++    g_rtl_audio_starve_frames += (uint64_t)(frames - usable);
+     s_render_starved = 1;
+     s_render_fade_pos = 0;
+     audio_trace_on_output_underflow(available, (uint32_t)(frames - usable));
+diff --git a/runner/src/common_rtl.h b/runner/src/common_rtl.h
+index ccb8fbd..212192b 100644
+--- a/runner/src/common_rtl.h
++++ b/runner/src/common_rtl.h
+@@ -71,6 +71,37 @@ void rtl_sync_apu_to_cpu_locked(void);
+  * AOT runs flush the SPC every ~1024 master cycles like the interp bridge. */
+ void rtl_apu_pace_check(void);
+ 
++/* ---- APU worker (second core) ----------------------------------------
++ *
++ * Off by default; the host opts in before the first RtlRunFrame. When on, the
++ * game thread stops advancing the SPC and instead publishes ONE target per
++ * frame -- the guest cycle at the end of the frame it just completed -- and a
++ * worker thread walks the SPC up to that ceiling on another core while the
++ * game thread runs the next frame.
++ *
++ * Determinism is preserved because the worker is paced by GUEST cycles, never
++ * wall-clock: the ceiling is a frame boundary, every queued port write is
++ * stamped with a guest cycle, and writes issued during frame N+1 necessarily
++ * carry stamps at or beyond that ceiling. Which APU cycle each event lands on
++ * is therefore independent of how far the worker happens to have got, exactly
++ * as it is independent of when the single-threaded build chose to flush.
++ * See HANDOFF.md section 10. */
++void RtlApuWorkerEnable(int on);
++int  rtl_apu_worker_active(void);
++/* Worker body, one bounded slice. Takes RtlApuLock, advances the SPC by at
++ * most max_cycles SPC cycles toward the published ceiling, releases it.
++ * Returns 1 while work remains (call again), 0 when the ceiling is reached.
++ * Slicing is what keeps the lock hold short enough that a game-thread port
++ * write or an audio callback does not wait behind a whole frame of SPC work;
++ * it does not affect which APU cycle anything lands on. */
++int  rtl_apu_worker_slice(uint32_t max_cycles);
++/* Worker instrumentation, read by the host's per-frame log. */
++void rtl_apu_worker_stats(uint64_t *slices, uint64_t *idle, uint64_t *late);
++/* Output-side starvation, counted rather than inferred: episodes and the
++ * output frames faded to silence. The only direct evidence that the DSP ring
++ * is deep enough with the APU running a frame behind. */
++extern uint64_t g_rtl_audio_starve_episodes, g_rtl_audio_starve_frames;
++
+ #ifdef SNES_COSIM
+ // Co-sim shared APU clock (SNES_COSIM_APU_SHARED=1, dev-only): pace the SPC
+ // purely from the HW-touch synthetic estimate on BOTH sides of a same-binary
+diff --git a/runner/src/cpu_state.c b/runner/src/cpu_state.c
+index 56c9224..d099de4 100644
+--- a/runner/src/cpu_state.c
++++ b/runner/src/cpu_state.c
+@@ -154,6 +154,19 @@ static void wlog_addr_lazy(void) {
+     g_wlog_addr_state = getenv("SNESRECOMP_WLOG_STATE") != NULL;
+ }
+ 
++
++#if defined(VITA) && FZERO_DIAG
++/* Vita stack-corruption watch. The wlog facility above logs to a FILE, which
++ * this host has no useful path for; route the same information to the network
++ * log instead. Reported through the host so the window and the address are the
++ * host's to choose. Covers every write path these two hooks cover, including
++ * the DMA and $2180 stores that bypass cpu_write8. */
++void FZeroWatchWrite(uint8 bank, uint16 addr, uint16 v, int width);
++#define FZERO_WATCH_WRITE(b, a, v, w) FZeroWatchWrite((b), (a), (v), (w))
++#else
++#define FZERO_WATCH_WRITE(b, a, v, w) ((void)0)
++#endif
++
+ static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) {
+     if (addr < g_wlog_addr_lo || addr > g_wlog_addr_hi) return;
+     if (g_wlog_addr_n++ >= g_wlog_addr_cap) return;
+@@ -493,6 +506,7 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
+         cart_note_cpu_bus(g_snes->cart, bank, addr);
+     cpu->open_bus = v;
+     if (g_wlog_active) wlog_note(bank, addr, v, 1);
++    FZERO_WATCH_WRITE(bank, addr, v, 1);
+     if (g_wlog_addr_enabled) {
+         if (g_wlog_addr_enabled < 0) wlog_addr_lazy();
+         if (g_wlog_addr_enabled > 0) wlog_addr_note(bank, addr, v, 1);
+@@ -571,6 +585,7 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
+         cart_note_cpu_bus(g_snes->cart, bank, addr);
+     cpu->open_bus = (uint8)v;
+     if (g_wlog_active) wlog_note(bank, addr, v, 2);
++    FZERO_WATCH_WRITE(bank, addr, v, 2);
+     if (g_wlog_addr_enabled) {
+         if (g_wlog_addr_enabled < 0) wlog_addr_lazy();
+         if (g_wlog_addr_enabled > 0) wlog_addr_note(bank, addr, v, 2);
+diff --git a/runner/src/cpu_state.h b/runner/src/cpu_state.h
+index a96f3a8..9d8bcc5 100644
+--- a/runner/src/cpu_state.h
++++ b/runner/src/cpu_state.h
+@@ -238,8 +238,26 @@ typedef enum RecompReturn {
+     RECOMP_RETURN_SKIP_1 = 1,
+     RECOMP_RETURN_SKIP_2 = 2,
+     RECOMP_RETURN_SKIP_3 = 3,
++    /* NOT a return code. Forces the enum's underlying type wide enough to hold
++     * RECOMP_RETURN_LLE_UNWIND_BASE (0x40000000), which is cast to this type by
++     * interp_bridge_lle_yield_unwind() and friends.
++     *
++     * Without it the declared range is 0..3, and under the ARM EABI -- where
++     * -fshort-enums is the DEFAULT -- GCC packs the enum into a single byte.
++     * The sentinel then truncates to 0 == RECOMP_RETURN_NORMAL, so every LLE
++     * yield unwind is silently reported as a normal return: the interpreter
++     * resumes at its COMPUTED return address instead of taking the yield path,
++     * and the guest return frame it pushed is stranded. S stays low for the
++     * rest of the run and an arbitrarily distant RTS then pops two bytes of
++     * another routine's frame. On x86-64 (int-sized enums) the bug is
++     * invisible, which is why it reproduced only on the Vita build. */
++    RECOMP_RETURN_WIDTH_GUARD = 0x7FFFFFFF,
+ } RecompReturn;
+ 
++/* The sentinel above is only meaningful if the type can hold it. */
++_Static_assert(sizeof(RecompReturn) >= 4,
++               "RecompReturn must be wide enough for RECOMP_RETURN_LLE_UNWIND_BASE");
++
+ /* ── Typed register access ────────────────────────────────────────────────
+  *
+  * The 65816 accumulator/index registers carry semantic width via M/X
+diff --git a/runner/src/desktop/sdl_compat.h b/runner/src/desktop/sdl_compat.h
+index c75cc36..f1cad35 100644
+--- a/runner/src/desktop/sdl_compat.h
++++ b/runner/src/desktop/sdl_compat.h
+@@ -16,8 +16,13 @@
+ #include <SDL3/SDL.h>
+ #include <SDL3/SDL_main.h>
+ #else
++/* SDL2: try both <SDL.h> and <SDL2/SDL.h> */
++#if __has_include(<SDL2/SDL.h>)
++#include <SDL2/SDL.h>
++#else
+ #include <SDL.h>
+ #endif
++#endif
+ 
+ #define SNESRECOMP_SDL_MIX_MAXVOLUME 128
+ 
+diff --git a/runner/src/host_paths.c b/runner/src/host_paths.c
+index 75b7c80..2f1453f 100644
+--- a/runner/src/host_paths.c
++++ b/runner/src/host_paths.c
+@@ -22,8 +22,11 @@
+ #  define snesrecomp_chdir chdir
+ #  define snesrecomp_getcwd getcwd
+ #endif
++/* Only include macOS-specific headers when not cross-compiling for Vita */
+ #ifdef __APPLE__
+-#  include <mach-o/dyld.h>
++#  ifndef __vita__
++#    include <mach-o/dyld.h>
++#  endif
+ #endif
+ 
+ /* Full path of the running executable. Returns 1 on success. Platforms
+@@ -33,7 +36,7 @@ static int get_exe_path(char *out, size_t max_len) {
+ #if defined(_WIN32)
+     DWORD n = GetModuleFileNameA(NULL, out, (DWORD)max_len);
+     return (n > 0 && n < max_len) ? 1 : 0;
+-#elif defined(__APPLE__)
++#elif defined(__APPLE__) && !defined(__vita__)
+     uint32_t size = (uint32_t)max_len;
+     return _NSGetExecutablePath(out, &size) == 0 ? 1 : 0;
+ #elif defined(__linux__)
+diff --git a/runner/src/mod_audio.c b/runner/src/mod_audio.c
+index 082f135..3121a6d 100644
+--- a/runner/src/mod_audio.c
++++ b/runner/src/mod_audio.c
+@@ -280,6 +280,17 @@ void snes_mod_audio_mix(int16_t *dst, int frame_count, uint32_t output_rate,
+     if (!dst || frame_count <= 0 || output_rate < 8000 || output_rate > 192000 ||
+         (output_channels != 1 && output_channels != 2))
+         return;
++    /* Nothing playing is the normal case -- and on a build with mods compiled
++     * out it is the ONLY case, since no voice can ever be created. Test it
++     * once per block instead of once per output frame: without this the loop
++     * below still reads, clamps and writes back every sample of every block
++     * to accomplish nothing. Measured on the Vita's audio thread at 281 us
++     * per 800-frame block, ~440 us per game frame, all of it inside the
++     * RtlApuLock hold that the APU worker contends with. */
++    int any_active = 0;
++    for (int v = 0; v < SNES_MOD_AUDIO_MAX_VOICES; ++v)
++        if (s_voices[v].clip != SNES_MOD_AUDIO_CLIP_INVALID) { any_active = 1; break; }
++    if (!any_active) return;
+     for (int frame = 0; frame < frame_count; ++frame) {
+         int64_t mixed[2] = { dst[(size_t)frame * output_channels], 0 };
+         if (output_channels == 2) mixed[1] = dst[(size_t)frame * 2 + 1];
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index d646737..030f83b 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -71,8 +71,37 @@ double apu_prof_ms = 0.0;
+ uint64_t bridgeq_prof_calls = 0;
+ double bridgeq_prof_ms = 0.0;
+ #endif
+-static void bridge_apu_flush(CpuState *cpu) {
++/* Two kinds of caller share this flush, and the APU worker separates them.
++ *
++ *  - RENDEZVOUS: an APU-port bus access is about to happen, so the SPC must
++ *    be current before it. Four sites, all in bridge_bus_read/write. These
++ *    run in worker mode too: the guest is genuinely waiting on the chip.
++ *  - PACING: the periodic ~1024-master-cycle flush and the bridge/bounce
++ *    exits. These exist only so a long run of guest code cannot leave the
++ *    SPC frozen -- interp_bridge's own comment above. A worker advancing the
++ *    SPC on another core makes them not merely redundant but wrong: they
++ *    would do the work on the game thread (the entire point is to move it
++ *    off) and push the SPC past the frame ceiling the worker is bounded by,
++ *    which is what keeps the schedule deterministic.
++ *
++ * Skipping a pacing flush does not change which APU cycle anything lands on.
++ * Port writes carry guest-cycle stamps (apu_schedulePortWrite), so they are
++ * applied at the same SPC cycle whether the advance happens now or later --
++ * the same argument as "flushing early is always correct", run backwards.
++ *
++ * The macro keeps the ~25 pacing call sites untouched; only the four
++ * rendezvous sites name the _ex form. */
++#define bridge_apu_flush(cpu) bridge_apu_flush_ex((cpu), 0)
++static void bridge_apu_flush_ex(CpuState *cpu, int rendezvous) {
+     if (!s_apu_pending_master) return;
++    if (!rendezvous && rtl_apu_worker_active()) {
++        /* Charge the cycles so a later rendezvous (or the non-worker path, if
++         * the toggle is flipped) does not double-count them, and keep the
++         * last-sync anchor moving so the AOT hook's delta stays honest. */
++        g_apu_last_sync_master = cpu->master_cycles;
++        s_apu_pending_master = 0;
++        return;
++    }
+ #ifdef SNESRECOMP_INTERP_PROFILE
+     { extern uint64_t apu_prof_calls; extern double apu_prof_ms;
+       apu_prof_calls++; }
+@@ -198,7 +227,7 @@ static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
+     bridge_timing_bus(adr);
+     int continuous=bridge_continuous_read(adr);
+     if (continuous) s_interp_continuous_read_epoch++;
+-    if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
++    if (bridge_is_apu_port(adr)) bridge_apu_flush_ex(cpu, 1);
+     uint8_t value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
+     if (continuous) {
+         BridgeDynamicValue *d=&s_bridge_dynamic_values[(adr^(adr>>8)^(adr>>16))&63];
+@@ -236,7 +265,7 @@ static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
+         if(reports++<131072) fprintf(stderr,"[apu_port] write $%04X=%02X master=%llu\n",
+           (unsigned)(uint16_t)adr,val,(unsigned long long)cpu->master_cycles);
+     }
+-    if (is_apu_port) bridge_apu_flush(cpu);
++    if (is_apu_port) bridge_apu_flush_ex(cpu, 1);
+     cpu_write8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF), val);
+     /* Re-sync the SPC after the port write so it can see the new data.
+      * bridge_apu_flush above consumed s_apu_pending_master, so calling it
+@@ -279,7 +308,7 @@ static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
+         s_interp_continuous_read_epoch++;
+     CpuState *cpu = (CpuState *)mem;
+     const int is_apu_port = bridge_is_apu_port(adrl);
+-    if (is_apu_port) bridge_apu_flush(cpu);
++    if (is_apu_port) bridge_apu_flush_ex(cpu, 1);
+     *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
+     if ((uint16_t)adrl == 0x2140 && bridge_apu_port_diag_enabled()) {
+         static uint16_t last=0xffff; static unsigned reports;
+@@ -316,7 +345,7 @@ static bool bridge_bus_write_word(void *mem, uint32_t adrl, uint32_t adrh,
+         if(reports++<131072) fprintf(stderr,"[apu_port] writew $%04X=%04X master=%llu\n",
+           (unsigned)(uint16_t)adrl,val,(unsigned long long)cpu->master_cycles);
+     }
+-    if (is_apu_port) bridge_apu_flush(cpu);
++    if (is_apu_port) bridge_apu_flush_ex(cpu, 1);
+     cpu_write16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF), val);
+     /* Re-sync SPC after port write so it can see the new data (same as
+      * bridge_bus_write byte path). */
+@@ -769,6 +798,16 @@ void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
+ #ifndef SNESRECOMP_LLE_BOUNCE_DEFAULT
+ #define SNESRECOMP_LLE_BOUNCE_DEFAULT 1
+ #endif
++/* Count of paired-call return frames the bounce path had to pop itself
++ * (see the repair at the bounce site). Nonzero means generated bodies are
++ * returning NORMAL without consuming their guest return frame. */
++unsigned long g_interp_paired_frame_repairs = 0;
++#if FZERO_DIAG
++struct InterpRepairLog { uint32_t target, site; int air; uint16_t sp_pre, sp_post; uint8_t fs; int sched_depth, in_sched, owner_depth; };
++struct InterpRepairLog g_interp_repair_log[8];
++unsigned long g_interp_bounce_imbalances = 0;
++#endif
++unsigned long g_interp_frame_left_for_ancestor = 0;
+ static int s_scheduler_aot_policy = -1;
+ void interp_bridge_set_scheduler_aot_policy(int enabled) {
+     s_scheduler_aot_policy = enabled < 0 ? -1 : enabled != 0;
+@@ -856,6 +895,49 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
+     }
+ }
+ 
++/* ── Always-on global interp step ring ─────────────────────────────────
++ * The per-run head[]/ring[] above are stack locals — invisible to a
++ * post-mortem or halt fired mid-run. This ring records EVERY interpreted
++ * step (pc, op, sp, frame) continuously so a late observer can read the
++ * interpreter's recent control flow backward (ring-buffer doctrine: no
++ * arm-then-capture). 8192 entries ≈ several frames of pure-interp code.
++ *
++ * Read it with interp_bridge_recent_step() below. There is deliberately no
++ * stderr dump here: upstream retired the g_interp_recent_dump_hook halt path
++ * in favour of the function-local ring, and the host that needs this one
++ * (the Vita port) has no usable stderr and logs over the network instead. */
++#if FZERO_DIAG
++#define ITRACE_RECENT_LEN 8192
++typedef struct { uint32_t pc; int32_t frame; uint16_t sp; uint8_t op; uint8_t pad; } ITraceRecentEnt;
++static ITraceRecentEnt g_itrace_recent[ITRACE_RECENT_LEN];
++static uint64_t g_itrace_recent_n = 0;
++#endif
++
++/* Programmatic read of the recent-step ring, for hosts with no usable stderr
++ * (the Vita port logs over the network). `back` is 1-based and counts
++ * backwards from the newest step. Returns 0 when `back` is out of range. */
++int interp_bridge_recent_step(int back, uint32_t *pc, uint8_t *op,
++                              uint16_t *sp, int32_t *frame) {
++#if !FZERO_DIAG
++    /* Ring not compiled in (FZERO_DIAG off): it costs a store on EVERY
++     * interpreted step plus 96KB of .bss, so it is not carried in a shipping
++     * build. Report "no history" rather than stale data. */
++    (void)back; (void)pc; (void)op; (void)sp; (void)frame;
++    return 0;
++#else
++    uint64_t have = g_itrace_recent_n < ITRACE_RECENT_LEN
++                        ? g_itrace_recent_n : ITRACE_RECENT_LEN;
++    if (back < 1 || (uint64_t)back > have) return 0;
++    const ITraceRecentEnt *e =
++        &g_itrace_recent[(g_itrace_recent_n - (uint64_t)back) & (ITRACE_RECENT_LEN - 1)];
++    if (pc) *pc = e->pc;
++    if (op) *op = e->op;
++    if (sp) *sp = e->sp;
++    if (frame) *frame = e->frame;
++    return 1;
++#endif
++}
++
+ /* Tier-2 coverage table (definitions below, § gap manifest): shared by the
+  * tier-down entries AND the in-bridge gap recorders in the core loop. */
+ enum { TIER2_KIND_DISPATCH = 0, TIER2_KIND_INDIRECT_GOTO = 1,
+@@ -1787,6 +1869,112 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+             if (itn < 8) head[itn] = _e;
+             if (trace) ring[itn & 255] = _e;
+             itn++;
++#if FZERO_DIAG
++            /* One store per interpreted step -- the hottest loop in the
++             * runtime -- so this is compiled out unless diagnostics are on. */
++            extern int snes_frame_counter;
++            ITraceRecentEnt *_g =
++                &g_itrace_recent[g_itrace_recent_n++ & (ITRACE_RECENT_LEN - 1)];
++            _g->pc = pc_before; _g->frame = snes_frame_counter;
++            _g->sp = in.sp; _g->op = op; _g->pad = 0;
++#endif
++#if defined(VITA) && FZERO_DIAG
++            /* Off-rails entry capture. A wedge in unmapped space runs far
++             * longer than the 8192-entry ring, so by bail time the ring holds
++             * only the wedge loop and the transition is long gone. Latch the
++             * crossing itself: the last mapped-bank step, and the first
++             * unmapped one. Cleared per frame by the host. */
++            { extern void interp_bridge_note_offrails_vita(uint32_t prev_pc,
++                                                           uint8_t prev_op,
++                                                           uint16_t prev_sp,
++                                                           uint32_t pc,
++                                                           uint8_t op);
++              static uint32_t s_prev_pc; static uint8_t s_prev_op;
++              static uint16_t s_prev_sp; static int s_prev_mapped;
++              uint8_t _bank = (uint8_t)(pc_before >> 16);
++              int _mapped = (_bank <= 0x07) || (_bank >= 0x80 && _bank <= 0x87) ||
++                            _bank == 0x7E || _bank == 0x7F;
++              /* Executing in page 0 or 1 is off the rails too, and the bank
++               * test alone never sees it: banks $00-$3F mirror WRAM below
++               * $2000, so a jump into the stack page lands at a *mapped*
++               * address like $03:01F1 and looks legitimate. This title keeps
++               * no code there -- direct page and stack only -- so treat it as
++               * a crossing and capture the approach that produced it. */
++              /* This is a LoROM title with no RAM-resident code: banks
++               * $00-$3F and $80-$BF hold ROM only at $8000-$FFFF, and
++               * everything below that is WRAM, the register file or open bus.
++               * Page 0/1 was too narrow -- the capture caught a jump from
++               * $03:0258 to $03:01DA, but $03:02xx is WRAM too, so execution
++               * had already left ROM well before that and the approach showed
++               * nothing but interpreted RAM garbage. Trip on the departure
++               * from ROM itself. */
++              if ((_bank <= 0x3Fu || (_bank >= 0x80u && _bank <= 0xBFu)) &&
++                  (pc_before & 0xFFFFu) < 0x8000u)
++                _mapped = 0;
++              if (s_prev_mapped && !_mapped)
++                interp_bridge_note_offrails_vita(s_prev_pc, s_prev_op, s_prev_sp,
++                                                 pc_before, op);
++              /* Emulation-mode transitions. In emulation mode the 65816
++               * forces M and X to 8-bit, so a REP #$30 cannot widen them and
++               * every following immediate decodes one byte short. Only XCE
++               * ($FB) enters it, and $FB also appears as the operand of the
++               * bands' BVC spin -- so a single mis-step into that byte flips
++               * the CPU into emulation and corrupts everything after. Record
++               * the step that does it. */
++              /* The crossing above ran with sp=00FF: the stack had already
++               * grown down out of page 1, roughly 254 bytes of unbalanced
++               * pushes. That is its own fault and happens before the PC goes
++               * anywhere, so report the step that first takes S out of
++               * $0100-$01FF. */
++              { extern void interp_bridge_note_stack_escape_vita(
++                    uint32_t pc, uint8_t op, uint16_t sp);
++                static int s_stack_escaped;
++                if (!s_stack_escaped && (in.sp < 0x0100u || in.sp > 0x01FFu)) {
++                  s_stack_escaped = 1;
++                  interp_bridge_note_stack_escape_vita(s_prev_pc, s_prev_op,
++                                                       in.sp);
++                }
++              }
++
++              { extern void interp_bridge_note_emulation_vita(
++                    uint32_t pc, uint8_t op, uint16_t sp, uint8_t to_e);
++                static int s_prev_e = -1;
++                int _e = in.e ? 1 : 0;
++                /* Report a transition, and also the FIRST step seen with e=1
++                 * in each run: the interpreter can arrive already in emulation
++                 * mode (inherited through sync_cpu_to_interp), in which case
++                 * there is no edge to catch inside the run at all. */
++                if (s_prev_e >= 0 && _e != s_prev_e)
++                  interp_bridge_note_emulation_vita(s_prev_pc, s_prev_op,
++                                                    in.sp, (uint8_t)_e);
++                else if (_e && s_prev_e < 0)
++                  interp_bridge_note_emulation_vita(pc_before, op, in.sp, 2);
++                s_prev_e = _e;
++              }
++
++              /* Entries into the raster handler region $00:8601-$00:8680.
++               * The host enters it only through bank_00_8601's AOT alias, so
++               * an LLE step arriving here from outside names whatever other
++               * route reaches it -- and carries the width it arrives with,
++               * which is the thing that decodes the bands wrong. */
++              { extern void interp_bridge_note_irq_entry_vita(
++                    uint32_t from_pc, uint8_t from_op, uint32_t pc,
++                    uint16_t sp, uint8_t mf, uint8_t xf, uint8_t e);
++                int _in_irq_region = (pc_before >= 0x008601u &&
++                                      pc_before <= 0x008680u);
++                int _was_in = (s_prev_pc >= 0x008601u &&
++                               s_prev_pc <= 0x008680u);
++                if (_in_irq_region && !_was_in)
++                  interp_bridge_note_irq_entry_vita(s_prev_pc, s_prev_op,
++                                                    pc_before, in.sp,
++                                                    (uint8_t)(in.mf ? 1 : 0),
++                                                    (uint8_t)(in.xf ? 1 : 0),
++                                                    (uint8_t)(in.e ? 1 : 0));
++              }
++              s_prev_pc = pc_before; s_prev_op = op; s_prev_sp = in.sp;
++              s_prev_mapped = _mapped;
++            }
++#endif
+         }
+         /* Env-gated diagnostic (SNESRECOMP_C2WATCH=1): log every interpreted
+          * opcode in the menu-blit range $C2:FC40-$C2:FF00 with the live mode
+@@ -1851,10 +2039,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                         "op=$%02X frame=%d sp=$%04X — corrupted control transfer\n",
+                         _pbnk, (unsigned)pc_before, op, snes_frame_counter,
+                         (unsigned)in.sp);
+-                    /* Step history at the trap. This branch had an
+-                     * always-on file-static ring (g_itrace_recent); main
+-                     * replaced it with the function-local one above, so use
+-                     * that instead of reviving a duplicate. `head` (first 8
++                    /* Step history at the trap. The always-on file-static
++                     * ring (g_itrace_recent) is readable only through
++                     * interp_bridge_recent_step; this stderr path uses the
++                     * function-local ring instead. `head` (first 8
+                      * steps) is always recorded; the 256-entry `ring` only
+                      * fills under SNESRECOMP_ITRACE, so pass total=0 when
+                      * untraced -- printing the entry path and claiming NO
+@@ -2105,6 +2293,24 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                             "sp_pre=$%04X aot_ret=%d sp_post=$%04X\n",
+                             op, (unsigned)pc_before, (unsigned)target,
+                             (unsigned)_sp_pre, (int)_air, (unsigned)in.sp);
++                /* Unconditional observation point: EVERY bounce whose callee
++                 * did not leave S at the pre-call value, recorded here before
++                 * any of the exit branches below, so no path can hide it.
++                 * Two successive guesses at which branch leaks the return
++                 * frame both produced 0 hits, so measure instead of infer. */
++#if FZERO_DIAG
++                if (in.sp == _sp_pre && g_interp_bounce_imbalances < 8) {
++                    struct InterpRepairLog *e =
++                        &g_interp_repair_log[g_interp_bounce_imbalances];
++                    e->target = target; e->site = pc_before;
++                    e->air = (int)_air; e->sp_pre = _sp_pre;
++                    e->sp_post = in.sp; e->fs = _fs;
++                    e->sched_depth = s_lle_sched_depth;
++                    e->in_sched = interp_bridge_in_lle_scheduler();
++                    e->owner_depth = s_interp_bounce_owner_depth;
++                    g_interp_bounce_imbalances++;
++                }
++#endif
+                 const uint32_t ret =
+                     (pc_before + (uint32_t)call_len +
+                      (uint32_t)cpu_dispatch_inline_arg_bytes(target)) & 0xFFFFFF;
+@@ -2209,6 +2415,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                         return 1;
+                     }
+                 }
++                /* NOTE: a blanket "pop the frame if it is still there" repair was
++                 * tried here and REVERTED. Measurement says 121 bounces per 60
++                 * frames return NORMAL with the frame still at _sp_pre, and all
++                 * but one of them are CORRECT that way -- popping them strands an
++                 * ancestor's return and fails immediately at the terminal RTL
++                 * $03:8126 with the screen stuck forced-blank. "Frame still
++                 * present after a NORMAL return" is therefore not a bug
++                 * signature, and no local predicate separating the broken case
++                 * from the other 120 has been found. The one proven-bad target is
++                 * excluded from bouncing by the host instead. */
+                 in.k  = (uint8)((ret >> 16) & 0xFF);
+                 in.pc = (uint16)(ret & 0xFFFF);
+                 /* Resume-task mode: a successful bounce is forward progress
+diff --git a/runner/src/snes/interp_bridge.h b/runner/src/snes/interp_bridge.h
+index 49231e6..607eaf9 100644
+--- a/runner/src/snes/interp_bridge.h
++++ b/runner/src/snes/interp_bridge.h
+@@ -57,6 +57,11 @@ void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
+                                        InterpPreOpcodeHook hook);
+ void interp_bridge_pre_opcode_redirect(uint32_t pc24);
+ 
++/* Programmatic read of the same ring for hosts without a usable stderr.
++ * `back` is 1-based from the newest step; returns 0 if out of range. */
++int interp_bridge_recent_step(int back, uint32_t *pc, uint8_t *op,
++                              uint16_t *sp, int32_t *frame);
++
+ /*
+  * Run the interpreter over guest code at entry_pc24, in the context of `cpu`.
+  * `cpu` is updated in place. Returns:
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 0b6f201..af4ab81 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -22,6 +22,51 @@ extern unsigned char g_snesrecomp_last_hdmaen;
+ extern Snes *g_snes;
+ extern unsigned char g_snesrecomp_last_hdmaen;
+ 
++#if defined(__vita__) && FZERO_PPUPROF
++/* Per-phase rasteriser timing for the Vita host's heartbeat. The upstream
++ * SNESRECOMP_INTERP_PROFILE split does not work here: it reports eval/bg/
++ * sprites as zero and derives compose by subtraction, so a phase with no
++ * PPU_T0 sites (Mode 7 has none) is silently absorbed into compose. These
++ * three are measured directly and cross-checked against the caller's total. */
++#include <psp2/kernel/processmgr.h>
++/* A/B switch for the sprite range-evaluation early-out (see
++ * ppu_evaluateSprites). 1 = early-out on, 0 = original path. */
++#define VPROF_T0(v) uint64_t v = sceKernelGetProcessTimeWide()
++#define VPROF_ACC(acc, v) do { uint64_t _n = sceKernelGetProcessTimeWide(); \
++                               (acc) += _n - (v); (v) = _n; } while (0)
++#else
++#define VPROF_T0(v) do { } while (0)
++#define VPROF_ACC(acc, v) do { } while (0)
++#endif
++/* Defined unconditionally so the host can print them without matching
++ * ifdefs; they simply stay zero when the probes are compiled out. */
++uint64_t g_ppuprof_eval, g_ppuprof_bg, g_ppuprof_compose;
++
++/* A/B switch for the compose loop's hoisted widescreen-HUD test. Defined for
++ * every host, not just Vita: PC verifies that the fast path is pixel-exact,
++ * Vita measures what it is worth. 1 = hoist on, 0 = original path. */
++int g_ppu_fast_compose = 1;
++/* Same, for the sprite range-evaluation early-out. Also defined for every
++ * host so PC can prove it pixel-exact. */
++int g_ppu_fast_sprite_eval = 1;
++/* Same, for the compose loop's palette lookup table (ppu->cgramLut). */
++int g_ppu_fast_cgram_lut = 1;
++
++/* Rebuild the palette -> host-pixel table. This is exactly the body of the
++ * no-math compose loop, run once per palette entry instead of once per pixel.
++ * Only the clip_color_mask == 0x1f case is tabulated; a clipped span takes
++ * the original per-pixel loop. */
++static void PpuBuildCgramLut(Ppu *ppu) {
++  const uint8_t *bm = ppu->brightnessMult;
++  for (int i = 0; i < 0x100; i++) {
++    uint32 color = ppu->cgram[i];
++    ppu->cgramLut[i] = (uint32)bm[color & 0x1f] << 16 |
++                       (uint32)bm[(color >> 5) & 0x1f] << 8 |
++                       (uint32)bm[(color >> 10) & 0x1f];
++  }
++  ppu->cgramLutValid = true;
++}
++
+ #ifdef SNESRECOMP_INTERP_PROFILE
+ static double g_ppu_sec_eval_ms = 0;
+ static double g_ppu_sec_line_ms = 0;
+@@ -64,6 +109,14 @@ void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+ 
+ static void PpuDrawWholeLine(Ppu *ppu, uint y);
+ 
++/* 1 = the sprite limits count only sprites and slivers that intersect x 0..255,
++ * as the hardware does, so widescreen margins neither spend nor lose budget.
++ * 0 = the old rule, which counted margin pieces too and dropped car pieces in
++ * busy margins. g_ppu_margin_spared counts the scanlines the old rule would
++ * have cut and this one drew in full. */
++int g_ppu_margin_limits_hw = 1;
++unsigned long g_ppu_margin_spared;
++
+ static bool ppu_evaluateSprites(Ppu* ppu, int line);
+ static uint16_t ppu_getVramRemap(Ppu* ppu);
+ static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line);
+@@ -107,6 +160,7 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
+   sli->func(sli, version, 8);
+   sli->func(sli, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
++  ppu->cgramLutValid = false;  /* a load rewrites cgram underneath the table */
+ }
+ 
+ void PpuResetWidescreenOamHistory(Ppu *ppu) {
+@@ -285,6 +339,48 @@ void PpuSetExtraSpace(Ppu *ppu, uint16_t extra) {
+   PpuResetLayerPolicies(ppu);
+ }
+ 
++void PpuSetMode7MarginTiles(Ppu *ppu, const uint8_t *tiles) {
++  ppu->m7MarginTiles = tiles;
++}
++
++void PpuSetWidescreenCentreSkip(Ppu *ppu, bool skip) {
++  ppu->wsCentreSkip = skip ? 1 : 0;
++}
++
++bool PpuWidescreenCentreSkipSafe(const Ppu *ppu, int y) {
++  // There has to BE a margin, or "skip the centre" means "draw nothing".
++  if (!(ppu->extraLeftCur | ppu->extraRightCur))
++    return false;
++  // Horizontal mosaic averages across x, so a margin pixel can be decided by
++  // a centre pixel. This is the only coupling in the drawers themselves.
++  if ((ppu->mosaic & 0x0f) && PPU_mosaicSize(ppu) > 1)
++    return false;
++  // Everything below rewrites the span list per line. None of them is wrong
++  // in principle, but each would have to be reasoned about against the split,
++  // and all are inert unless a host asked for them.
++  if (ppu->widescreenLineEnhancer || ppu->wsMode2CaptureLayer ||
++      ppu->wsHudSplitHeight || ppu->wsHudOamHeight ||
++      ppu->wsWindowExpandLayers)
++    return false;
++  if (PpuWidescreenLineRepeatBandActive(ppu, y))
++    return false;
++  for (unsigned int layer = 0; layer < 4; layer++) {
++    if (ppu->wsMarginGapL[layer] | ppu->wsMarginGapR[layer] |
++        ppu->wsViewportInsetL[layer] | ppu->wsViewportInsetR[layer])
++      return false;
++    if (PpuWidescreenLayerWorldBandAt(ppu, layer, y) >= 0 ||
++        PpuWidescreenLayerElasticBandAt(ppu, layer, y) >= 0)
++      return false;
++    for (unsigned int slot = 0; slot < kPpuWsAnchorBands; slot++) {
++      if (y >= ppu->wsAnchorY0[slot][layer] &&
++          y < ppu->wsAnchorY1[slot][layer] &&
++          ppu->wsAnchorLeftEnd[slot][layer])
++        return false;
++    }
++  }
++  return true;
++}
++
+ void PpuSetExtraSpaceCentered(Ppu *ppu, uint16_t budget) {
+   if (budget > kPpuExtraLeftRight)
+     budget = kPpuExtraLeftRight;
+@@ -647,6 +743,19 @@ static inline void PpuActiveSpan(const Ppu *ppu, size_t *begin,
+ static inline void ClearBackdrop(const Ppu *ppu, PpuPixelPrioBufs *buf) {
+   size_t begin, end;
+   PpuActiveSpan(ppu, &begin, &end);
++  // With the centre skipped nothing writes it and nothing reads it, so
++  // clearing it is 64% of this memset spent on pixels that are discarded.
++  // Both bounds are multiples of 4 (kPpuExtraLeftRight is 272 and kPpuXPixels
++  // 256), so the two ranges land on the same uint64 stores as the whole one.
++  if (ppu->wsCentreSkip) {
++    size_t centre_begin = (size_t)kPpuExtraLeftRight;
++    size_t centre_end = (size_t)kPpuExtraLeftRight + kPpuXPixels;
++    for (size_t i = begin; i < centre_begin; i += 4)
++      *(uint64*)&buf->data[i] = 0x0500050005000500;
++    for (size_t i = centre_end; i < end; i += 4)
++      *(uint64*)&buf->data[i] = 0x0500050005000500;
++    return;
++  }
+   for (size_t i = begin; i < end; i += 4)
+     *(uint64*)&buf->data[i] = 0x0500050005000500;
+ }
+@@ -725,6 +834,7 @@ void ppu_runLine(Ppu* ppu, int line) {
+         ((i << 3) | (i >> 2)) * ppu_brightness / 15;
+       // Store 31 extra entries to remove the need for clamping to 31.
+       memset(&ppu->brightnessMult[32], ppu->brightnessMult[31], 31);
++      ppu->cgramLutValid = false;
+     }
+ 
+     // evaluate sprites
+@@ -732,7 +842,9 @@ void ppu_runLine(Ppu* ppu, int line) {
+     if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
+       memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
+              sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
+-    ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
++    { VPROF_T0(_ev);
++      ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
++      VPROF_ACC(g_ppuprof_eval, _ev); }
+ 
+     if (ppu->renderFlags & kPpuRenderFlags_NewRenderer) {
+       PPU_T0; PpuDrawWholeLine(ppu, line); PPU_ACC(g_ppu_sec_line_ms);
+@@ -756,12 +868,42 @@ typedef struct PpuWindows {
+ // clamped to the authentic 256-wide region so a BG3 status bar never tiles into
+ // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
+ // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
++static void PpuWindowsSplit(PpuWindows *win, int16 *bias, int xpos);
++
++// Split the span list at the authentic screen edges and mark everything
++// between them as already drawn. Splitting is exact: every drawer re-seeds its
++// source coordinates from win.edges[windex] at the top of each span -- the
++// Mode 7 affine chain included -- so two spans render the same pixels one
++// span would. Only the bits change what is drawn.
++//
++// LAYER 5 IS THE COLOUR WINDOW and is deliberately left unmarked: the compose
++// loop reads cwin.bits to decide clip and colour-math per span, so setting a
++// bit there would change the MARGINS. The compose loop does its own skip on
++// the span bounds instead, which is why the split still happens for layer 5.
++//
++// The bias array only matters for the per-line policies that use it, and
++// PpuWidescreenCentreSkipSafe refuses the whole scheme when any of those is
++// live -- so the caller's bias is all zeroes and a scratch one is equivalent.
++static void PpuApplyCentreSkip(PpuWindows *win, uint layer) {
++  int16 bias[8] = { 0 };
++  PpuWindowsSplit(win, bias, 0);
++  PpuWindowsSplit(win, bias, kPpuXPixels);
++  if (layer == 5)
++    return;
++  for (uint i = 0; i < win->nr; i++) {
++    if (win->edges[i] >= 0 && win->edges[i + 1] <= kPpuXPixels)
++      win->bits |= (uint8)(1u << i);
++  }
++}
++
+ static void PpuWindows_Clear(PpuWindows *win, Ppu *ppu, uint layer, int y) {
+   win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, ppu->extraLeftCur);
+   win->edges[1] = 256 + PpuWidescreenLayerExtra(ppu, layer, y,
+                                                 ppu->extraRightCur);
+   win->nr = 1;
+   win->bits = 0;
++  if (ppu->wsCentreSkip)
++    PpuApplyCentreSkip(win, layer);
+ }
+ 
+ static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
+@@ -854,6 +996,8 @@ static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
+   } else {
+     win->bits = w1_bits | w2_bits;
+   }
++  if (ppu->wsCentreSkip)
++    PpuApplyCentreSkip(win, layer);
+   debug_server_on_ppu_window(y, (int)layer, win->edges, win->nr, win->bits);
+ }
+ 
+@@ -1941,6 +2085,40 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+     (ppu->m7matrix[1] * clippedV & ~63) + (xCenter << 8);
+   uint32 m7startY = (ppu->m7matrix[2] * clippedH & ~63) + (ppu->m7matrix[3] * ry & ~63) +
+     (ppu->m7matrix[3] * clippedV & ~63) + (yCenter << 8);
++  /* Hoisted out of the per-pixel loops. PpuRenderVram is a field load plus a
++   * null test, and the disassembly showed GCC re-doing BOTH on every pixel
++   * (ldr r5,[r4,#3396] / cmp / moveq) in each of the two gathers. The value
++   * cannot change here -- only the host binds renderVram, outside drawing --
++   * so the repeat work is pure loss.
++   *
++   * WHY it was repeated is NOT established. Aliasing is the obvious guess and
++   * is probably wrong: a uint16 store cannot alias a pointer field under the
++   * strict aliasing this builds with. Register pressure fits the evidence
++   * better -- after hoisting, the pointer lives in a STACK SLOT rather than a
++   * register, which is what a compiler does when it has none to spare. Either
++   * way the fix is the same and the removed work is a cmp and a moveq per
++   * gather; do not quote a cause here that nobody measured.
++   *
++   * This one gets NO A/B global, unlike the others. With the hoisted value in
++   * scope GCC folds `flag ? m7vram : PpuRenderVram(ppu)` to a single load and
++   * the switch never reaches the code -- verified in the asm, no reference to
++   * the global outside .data. A lever that cannot restore the slow arm would
++   * measure nothing, so its worth is a bg+mode7 delta across builds. */
++  const uint16_t *const m7vram = PpuRenderVram(ppu);
++#define M7VRAM m7vram
++  /* Host-supplied margin tiles (see Ppu::m7MarginTiles). Splitting the span
++   * list at the authentic screen edges turns "which tile source" from a test
++   * on every pixel into one test per span -- which matters here, because this
++   * is the largest per-pixel loop in the renderer and it is already short of
++   * registers. The split is exact for the same reason the centre skip is: the
++   * affine chain below re-seeds from win.edges[windex] rather than carrying
++   * xpos/ypos across the boundary. */
++  const uint8_t *const m7margin = ppu->m7MarginTiles;
++  if (m7margin && !mosaic_enabled && !ppu->wsCentreSkip) {
++    int16 split_bias[8] = { 0 };
++    PpuWindowsSplit(&win, split_bias, 0);
++    PpuWindowsSplit(&win, split_bias, kPpuXPixels);
++  }
+   for (size_t windex = 0; windex < win.nr; windex++) {
+     if (win.bits & (1 << windex))
+       continue;  // layer is disabled for this window part
+@@ -1963,14 +2141,36 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+             continue;
+           tile = 0;
+         } else {
+-          tile = PpuRenderVram(ppu)[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
++          tile = M7VRAM[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+         }
+-        uint8 pixel = PpuRenderVram(ppu)[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
++        uint8 pixel = M7VRAM[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+         if (pixel) {
+           int i = 0;
+           do dstz[i] = pixel + z; while (++i != w);
+         }
+       } while (xpos += dx * w, ypos += dy * w, dstz += w, w = PPU_mosaicSize(ppu), dstz_end - dstz != 0);
++    } else if (m7margin && (x2 <= 0 || x >= kPpuXPixels)) {
++      /* A margin span. The tile number comes from the host's per-column array
++       * instead of the tilemap word; everything else -- the outside-field
++       * test, char fill, the character fetch and the priority store -- is the
++       * loop above, unchanged. The out-of-field branch must still bypass it,
++       * because that is exactly where the hardware does not read a tilemap
++       * cell at all. */
++      const uint8_t *mt = m7margin +
++          (x2 <= 0 ? x + ppu->extraLeftRight
++                   : x - kPpuXPixels + ppu->extraLeftRight);
++      do {
++        if ((uint32)(xpos | ypos) > outside_value) {
++          if (!char_fill)
++            continue;
++          tile = 0;
++        } else {
++          tile = *mt;
++        }
++        uint8 pixel = M7VRAM[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
++        if (pixel)
++          dstz[0] = pixel + z;
++      } while (xpos += dx, ypos += dy, ++mt, ++dstz != dstz_end);
+     } else {
+       do {
+         if ((uint32)(xpos | ypos) > outside_value) {
+@@ -1978,14 +2178,15 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+             continue;
+           tile = 0;
+         } else {
+-          tile = PpuRenderVram(ppu)[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
++          tile = M7VRAM[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+         }
+-        uint8 pixel = PpuRenderVram(ppu)[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
++        uint8 pixel = M7VRAM[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+         if (pixel)
+           dstz[0] = pixel + z;
+       } while (xpos += dx, ypos += dy, ++dstz != dstz_end);
+     }
+   }
++#undef M7VRAM
+ }
+ 
+ static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
+@@ -2129,6 +2330,7 @@ static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
+ }
+ 
+ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
++  PPU_T0_DECL   /* SNESRECOMP_INTERP_PROFILE: PPU_ACC below needs it */
+   // Top 4 bits contain the prio level, and bottom 4 bits the layer type.
+   // SPRITE_PRIO_TO_PRIO can be used to convert from obj prio to this prio.
+   //  15: BG3 tiles with priority 1 if bit 3 of $2105 is set
+@@ -2241,6 +2443,8 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+     return;
+   }
+ 
++  VPROF_T0(_ph);
++
+   // Default background is backdrop
+   ClearBackdrop(ppu, &ppu->bgBuffers[0]);
+ 
+@@ -2284,6 +2488,8 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   bool any_hud_full_width =
+       hud_full_width || oam_hud_full_width || anchor_full_width;
+ 
++  VPROF_ACC(g_ppuprof_bg, _ph);
++
+   // Color window affects the drawing mode in each region
+   PpuWindows cwin;
+   PpuWindows_Calc(&cwin, ppu, 5, y);
+@@ -2317,26 +2523,67 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   uint32 hud_world_left = kPpuExtraLeftRight - ppu->extraLeftCur;
+   uint32 hud_world_right = kPpuExtraLeftRight + 256 + ppu->extraRightCur;
+ 
++  if (g_ppu_fast_cgram_lut && !ppu->cgramLutValid)
++    PpuBuildCgramLut(ppu);
++
+   uint32 windex = 0;
+   do {
+     uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
++    /* The centre skip's second hand-done site (the first is ClearBackdrop).
++     * The drawers take it from the span BITS, but cwin's bits carry clip and
++     * colour-math state that the margins still need, so this span is dropped
++     * on its bounds instead. dst walks with the pixel loop rather than being
++     * indexed, so it has to be advanced past the span that was not written. */
++    if (ppu->wsCentreSkip && left >= (uint32)kPpuExtraLeftRight &&
++        right <= (uint32)(kPpuExtraLeftRight + kPpuXPixels)) {
++      dst += right - left;
++      continue;
++    }
++    /* The per-pixel widescreen-HUD blanking test depends only on i and on
++     * booleans already fixed for this scanline. If no full-width HUD is
++     * active AND this span lies entirely inside the world, it can never
++     * blank a pixel, so it is decided once here instead of per pixel --
++     * removing two range checks and, in the no-math loop, a nibble extract
++     * and three comparisons from every pixel. With widescreen off it is
++     * always inert: hud_world is [272, 528) and the span is exactly that. */
++    const bool hud_checks_needed =
++        !g_ppu_fast_compose || any_hud_full_width ||
++        left < hud_world_left || right > hud_world_right;
+     // If clip is set, then zero out the rgb values from the main screen.
+     uint32 clip_color_mask = (cw_clip_math & 1) ? 0x1f : 0;
+     uint32 math_enabled_cur = PPU_mathEnabled(ppu) & ((cw_clip_math & 0x100) ? -1 : 0);
+     uint32 fixed_color = ppu->fixedColor;
+     if (math_enabled_cur == 0 || fixed_color == 0 && !PPU_halfColor(ppu) && !rendered_subscreen) {
+       // Math is disabled (or has no effect), so can avoid the per-pixel maths check
++      /* Table-driven span: with no HUD blanking to decide and no clip, every
++       * pixel is cgram -> brightnessMult -> pack, which depends only on the
++       * palette index. That is precomputed in ppu->cgramLut, so the whole
++       * body collapses to one load and one store. A clipped span (mask 0)
++       * falls through to the original loop: it is rare, and the Vita text
++       * segment has ~0 bytes of slack in a PPUPROF build. */
++      if (g_ppu_fast_cgram_lut && !hud_checks_needed &&
++          clip_color_mask == 0x1f) {
++        const uint32 *lut = ppu->cgramLut;
++        const uint16 *src = ppu->bgBuffers[0].data;
++        uint32 i = left;
++        do { dst[0] = lut[src[i] & 0xff]; } while (dst++, ++i < right);
++        continue;
++      }
+       uint32 i = left;
+       do {
+         uint16 pixel = ppu->bgBuffers[0].data[i];
+-        bool outside_world = i < hud_world_left || i >= hud_world_right;
+-        const uint8 main_layer = (pixel >> 8) & 0xf;
+-        const bool keep_hud =
+-            (hud_full_width && main_layer == 2) ||
+-            (anchor_full_width && main_layer == anchor_full_layer) ||
+-            (oam_hud_full_width &&
+-             (main_layer == 4 || main_layer == 6));
+-        if (outside_world && !keep_hud) {
++        bool blank = false;
++        if (hud_checks_needed) {
++          bool outside_world = i < hud_world_left || i >= hud_world_right;
++          const uint8 main_layer = (pixel >> 8) & 0xf;
++          const bool keep_hud =
++              (hud_full_width && main_layer == 2) ||
++              (anchor_full_width && main_layer == anchor_full_layer) ||
++              (oam_hud_full_width &&
++               (main_layer == 4 || main_layer == 6));
++          blank = outside_world && !keep_hud;
++        }
++        if (blank) {
+           dst[0] = 0;
+         } else {
+           uint32 color = ppu->cgram[pixel & 0xff];
+@@ -2354,15 +2601,29 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+       do {
+         uint16 pixel = ppu->bgBuffers[0].data[i];
+         uint8 main_layer = (pixel >> 8) & 0xf;
+-        bool outside_world = i < hud_world_left || i >= hud_world_right;
+-        const bool keep_hud =
+-            (hud_full_width && main_layer == 2) ||
+-            (anchor_full_width && main_layer == anchor_full_layer) ||
+-            (oam_hud_full_width &&
+-             (main_layer == 4 || main_layer == 6));
+-        if (outside_world && !keep_hud) {
++        bool blank = false;
++        if (hud_checks_needed) {
++          bool outside_world = i < hud_world_left || i >= hud_world_right;
++          const bool keep_hud =
++              (hud_full_width && main_layer == 2) ||
++              (anchor_full_width && main_layer == anchor_full_layer) ||
++              (oam_hud_full_width &&
++               (main_layer == 4 || main_layer == 6));
++          blank = outside_world && !keep_hud;
++        }
++        if (blank) {
+           dst[0] = 0;
+-        } else {
++          continue;
++        }
++        if (g_ppu_fast_cgram_lut && clip_color_mask == 0x1f &&
++            !(math_enabled_cur & (1 << main_layer))) {
++          /* No math for this layer: identical to the no-math body, so the
++           * same table answers it. `continue` in a do-while runs the comma
++           * expression below, which is the dst++/++i the slow path does. */
++          dst[0] = ppu->cgramLut[pixel & 0xff];
++          continue;
++        }
++        {
+           uint32 color = ppu->cgram[pixel & 0xff], color2;
+           uint32 r = color & clip_color_mask;
+           uint32 g = (color >> 5) & clip_color_mask;
+@@ -2395,6 +2656,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
+ 
+   PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
++  VPROF_ACC(g_ppuprof_compose, _ph);
+ }
+ 
+ static bool PpuWidescreenHudOamSlot(Ppu *ppu, uint8_t index, uint8_t y) {
+@@ -2507,14 +2769,35 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+   int spritesFound = 0;
+   int tilesFound = 0;
+   uint8_t foundSprites[128];
++  /* Sprites and slivers the HARDWARE counts, see `counted` below. */
++  int rangeCounted = 0;
++  bool timeOverHit = false;
++  int rangeTiles = 0;
++  const bool wideMargins = ppu->extraLeftCur != 0 || ppu->extraRightCur != 0 ||
++                           ppu->extraLeftRight != 0;
++
++  /* Loop-invariant: neither obsel nor the interlace bit changes inside the
++   * walk. Hoisted for BOTH arms of the early-out A/B, so the toggle measures
++   * only the early-out itself. */
++  const uint8 *sizes = spriteSizes[PPU_objSize(ppu)];
++  const int interlaced = PPU_objInterlace(ppu) ? 1 : 0;
++  /* sizes[1] >= sizes[0] for every row of the table above, so a scanline past
++   * the taller of the pair cannot intersect EITHER size. Rejecting on that
++   * bound is exact -- it skips only sprites the real test rejects too -- and
++   * it avoids the highOam shift and table index for the ~120 sprites per line
++   * that do not intersect it. Order, limits and the forward walk are
++   * untouched, which matters: range evaluation walks OAM forward while tile
++   * fetching walks it backward, and that is observable at the 34-sliver cap. */
++  const int maxSpriteHeight = interlaced ? sizes[1] / 2 : sizes[1];
+ 
+   // Range evaluation walks OAM forward, but tile fetching walks the accepted
+   // sprites backward. This is observable when the 34-sliver limit is reached.
+   for(int i = 0; i < 128; i++) {
+     uint8_t y = ppu->oam[index] >> 8;
+     uint8_t row = line - y;
+-    int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+-    int spriteHeight = PPU_objInterlace(ppu) ? spriteSize / 2 : spriteSize;
++    if (g_ppu_fast_sprite_eval && row >= maxSpriteHeight) { index += 2; continue; }
++    int spriteSize = sizes[(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
++    int spriteHeight = interlaced ? spriteSize / 2 : spriteSize;
+     if(row < spriteHeight) {
+       int x = PpuDecodeOamX(ppu, index);
+       const int left_extra =
+@@ -2526,14 +2809,24 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+                                           left_extra)) {
+         x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
+         if(x + spriteSize > -left_extra) {
+-          spritesFound++;
+-          if(spritesFound > 32 &&
+-             !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
+-            ppu->rangeOver = true;
+-            spritesFound = 32;
+-            break;
++          /* The hardware limits count only what the hardware can see: a
++           * sprite that intersects x 0..255. A sprite that lies only in a
++           * widescreen margin is off-screen on the real console, so it must
++           * neither use the 32-sprite budget nor be dropped by it. Without
++           * margins every sprite here intersects 0..255, as before. */
++          const bool counted = !g_ppu_margin_limits_hw ||
++                               (x < 256 && x + spriteSize > 0);
++          if (counted) {
++            if (++rangeCounted > 32 &&
++                !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
++              ppu->rangeOver = true;
++              rangeCounted = 32;
++              if (!wideMargins || !g_ppu_margin_limits_hw) break;
++              index += 2;
++              continue;
++            }
+           }
+-          foundSprites[spritesFound - 1] = index;
++          foundSprites[spritesFound++] = index;
+         }
+       }
+     }
+@@ -2567,10 +2860,19 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+          col + x >= 256 + right_extra)
+         continue;
+             tilesFound++;
+-            if(tilesFound > 34 &&
+-               !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
+-              ppu->timeOver = true;
+-              break;
++            /* As for the range limit: only a sliver the hardware fetches,
++             * one that intersects x 0..255, counts toward the 34. Once they
++             * are exhausted the hardware fetches nothing more, so later
++             * counted slivers are dropped, but margin-only ones still draw. */
++            if (!g_ppu_margin_limits_hw || (col + x > -8 && col + x < 256)) {
++              if (timeOverHit) continue;
++              if (++rangeTiles > 34 &&
++                  !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
++                ppu->timeOver = true;
++                timeOverHit = true;
++                if (!wideMargins || !g_ppu_margin_limits_hw) break;
++                continue;
++              }
+             }
+             int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
+       int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) |
+@@ -2608,12 +2910,19 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+               }
+         // Lower OAM indices are processed later and overwrite higher ones.
+                 dst[0] = z + pixel;
++                ppu->objSlotOf[dst - ppu->objBuffer.data] = (uint8_t)slot;
+             }
+         }
+-        if(tilesFound > 34 &&
+-           !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits))
++        if(timeOverHit && (!wideMargins || !g_ppu_margin_limits_hw))
+       break;
+   }
++  /* A line the old rule would have cut: more than 32 sprites or 34 slivers
++   * in total, while the ones the hardware counts stayed within budget. */
++  if (wideMargins && g_ppu_margin_limits_hw &&
++      !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) &&
++      ((spritesFound > 32 && !ppu->rangeOver) ||
++       (tilesFound > 34 && !timeOverHit)))
++    ++g_ppu_margin_spared;
+   return tilesFound != 0;
+ }
+ 
+@@ -2922,7 +3231,25 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
+   }
+ }
+ 
++/* TEMPORARY PROBE (HANDOFF.md 12, strategy C): which PPU ports actually change
++ * BETWEEN scanlines, and from where. Session 6 measured the data ports (VRAM,
++ * CGRAM, OAM: zero mid-frame writes, all in vblank) and the HDMA register
++ * stream, and concluded 16 bytes/line would be enough to journal and replay a
++ * deferred wide pass. It did not cover the fourth source: this host dispatches
++ * the raster-split IRQ INLINE in the draw loop (fzero_rtl.c calls
++ * bank_00_8601 at the trigger line), so guest code runs between scanlines and
++ * whatever it writes to $2100-$213F never passed through HDMA.
++ *
++ * The host sets g_ppu_line_write_src to say which source is running; every
++ * write is then charged to it, per port. Off (0) at every other moment, which
++ * includes the whole vblank CPU half, so the counts are mid-frame only.
++ * One predictable branch per register write when the probe is not armed. */
++int g_ppu_line_write_src;                    /* 0 = off / not in the draw loop */
++unsigned long g_ppu_line_writes[4][0x40];    /* [src][port & 0x3f] */
++
+ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
++  if (g_ppu_line_write_src)
++    g_ppu_line_writes[g_ppu_line_write_src & 3][adr & 0x3f]++;
+ //  if (adr != 24 && adr != 25)
+ //    printf("ppu_write(%d, %d)\n", adr, val);
+   switch(adr) {
+@@ -2948,6 +3275,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+       if(ppu->oamInHigh) {
+         int hidx = ((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite;
+         ppu->highOam[hidx] = val;
++        ppu->oamCgramVersion++;
+         debug_server_on_oam_write(1, (uint16_t)hidx, (uint16_t)val);
+         if(ppu->oamSecondWrite) {
+           ppu->oamAdr++;
+@@ -2960,6 +3288,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+           uint16_t widx = ppu->oamAdr;
+           uint16_t word = (uint16_t)((val << 8) | ppu->oamBuffer);
+           ppu->oam[ppu->oamAdr++] = word;
++          ppu->oamCgramVersion++;
+           debug_server_on_oam_write(0, widx, word);
+           if(ppu->oamAdr == 0) ppu->oamInHigh = true;
+         }
+@@ -3038,6 +3367,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+       // TODO: vram access during rendering (also cgram and oam)
+       uint16_t vramAdr = ppu_getVramRemap(ppu);
+       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
++      ppu->vramVersion++;
+       // $2118 == low byte of word; byte_addr = word << 1.
+       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+ #if SNESRECOMP_ENABLE_MODS
+@@ -3051,6 +3381,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+     case 0x19: {
+       uint16_t vramAdr = ppu_getVramRemap(ppu);
+       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
++      ppu->vramVersion++;
+       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
+       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+ #if SNESRECOMP_ENABLE_MODS
+@@ -3085,6 +3416,8 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+         ppu->cgramBuffer = val;
+       } else {
+         ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
++        ppu->oamCgramVersion++;
++        ppu->cgramLutValid = false;
+       }
+       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
+       break;
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 093c6e0..75a2f2d 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -314,6 +314,13 @@ struct Ppu {
+   uint32_t renderFlags;
+   PpuPixelPrioBufs bgBuffers[2];
+   PpuPixelPrioBufs objBuffer;
++  /* Winning OAM slot per pixel of objBuffer, for the line just drawn. Read it
++   * only where objBuffer's low byte is non-zero: the backdrop clear writes
++   * 0x0500 and every sprite store carries a non-zero palette index, so a
++   * non-zero low byte is what says this line wrote both. It lets a host answer
++   * "which sprite covered this pixel" without re-rendering the line once per
++   * OAM range. Host-only derived state, never emulated state. */
++  uint8_t objSlotOf[kPpuBufWidth];
+   /* Per-source isolated priority pixels for generic host-overlay captures. */
+   PpuPixelPrioBufs overlayBuffers[kPpuOverlaySource_Count];
+   PpuOverlayCapture overlayCaptures[kPpuOverlaySource_Count];
+@@ -322,12 +329,60 @@ struct Ppu {
+   /* Optional host picture memory. Drawing only: CPU ports and save states
+    * always use vram. The caller owns 32768 words until unbound. */
+   const uint16_t *renderVram;
++  /* Optional host-supplied Mode 7 tilemap IDs for the widescreen margins.
++   * When bound, a Mode 7 pixel whose screen x falls outside [0,256) takes its
++   * tile number from here -- index x+extraLeftRight on the left, and
++   * x-256+extraLeftRight on the right -- instead of from the tilemap word in
++   * picture memory. It exists because a host that widens a Mode 7 view samples
++   * course positions the game never uploaded: the 128x128 tilemap wraps, so
++   * those cells hold tiles from elsewhere. Supplying the correct tile per
++   * MARGIN COLUMN is exact where patching the tilemap is not, because 16,384
++   * cells are time-shared between the margin columns and two columns on one
++   * line can need different tiles from one cell.
++   *
++   * Drawing only, like renderVram: nothing else reads it, and emulated state
++   * is never touched. The caller owns 2*extraLeftRight bytes until unbound. */
++  const uint8_t *m7MarginTiles;
++  /* Skip the authentic 256-wide centre. A host that renders a widened frame
++   * twice -- once at 256 for the authentic output, once wider for the margins
++   * -- discards the wider render's centre. With this set every window span
++   * list is split at x=0 and x=256 and the spans inside that range are marked
++   * as already drawn, so the drawers and the compose loop skip them. Only ever
++   * valid when the caller genuinely discards those pixels; see
++   * PpuWidescreenCentreSkipSafe for the per-line conditions that make the
++   * remaining margins byte-identical. */
++  uint8_t wsCentreSkip;
+   uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
+   uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
+   uint8_t brightnessMult[32 + 31];
+   uint8_t brightnessMultHalf[32 * 2];
+   uint8_t mosaicModulo[kPpuXPixels];
+ 
++  /* Compose fast path: cgram index -> packed host pixel, at the current
++   * brightness. The compose loop's per-pixel body is a cgram load plus three
++   * brightnessMult lookups and two shifts; all of it depends only on the
++   * palette entry, so it is table-driven instead. Host-only cache, rebuilt
++   * lazily -- invalidated by the two things it depends on (a $2122 cgram
++   * write and a brightness change) and by savestate load. Sits OUTSIDE the
++   * snapshot region: it is derived state, never emulated state. */
++  uint32_t cgramLut[0x100];
++  bool cgramLutValid;
++  /* Bumped by every guest write into oam[], highOam[] or cgram[]. Host-only,
++   * like vramVersion. A host that keeps a copy of those arrays across
++   * scanlines uses it to tell whether the copy is still current. The writers
++   * today are ppu_write's $2104 and $2122; a new writer MUST bump it. 16 bits
++   * so it sits in the padding after cgramLutValid: vram must stay the last
++   * field with no tail padding. A false match needs exactly 65,536 writes
++   * between two checks, and a whole OAM upload is 544. */
++  uint16_t oamCgramVersion;
++
++  /* Bumped by every write into vram[]. Host-only and derived, never emulated
++   * state. It exists so a host holding a VRAM copy can tell whether it is
++   * still current without comparing 64 KB -- see fzero_wide_vram.h. Any new
++   * vram writer MUST bump it; the three today are ppu_write's $2118/$2119,
++   * common_rtl's WriteVramWord, and the text-translation mod. */
++  uint32_t vramVersion;
++
+   // Host-only widescreen state; excluded from savestates and cleared by reset.
+   PpuWidescreenLineEnhancer *widescreenLineEnhancer;
+   void *widescreenLineEnhancerContext;
+@@ -512,6 +567,8 @@ void ppu_reset(Ppu* ppu);
+ bool ppu_checkOverscan(Ppu* ppu);
+ void ppu_handleVblank(Ppu* ppu);
+ void ppu_runLine(Ppu* ppu, int line);
++extern int g_ppu_margin_limits_hw;
++extern unsigned long g_ppu_margin_spared;
+ void ppu_sec_reset(void);
+ void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+                   double *compose, double *hdma);
+@@ -625,6 +682,32 @@ bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
+ // extraRightCur/extraLeftRight machinery used by the line renderer.
+ void PpuSetExtraSpace(Ppu *ppu, uint16_t extra);
+ 
++// Bind (or unbind, with NULL) the per-margin-column Mode 7 tile IDs described
++// at Ppu::m7MarginTiles. The array holds 2*extraLeftRight bytes: the left
++// margin's columns in screen order first, then the right margin's.
++void PpuSetMode7MarginTiles(Ppu *ppu, const uint8_t *tiles);
++
++/* TEMPORARY PROBE, see ppu.c. A host that runs work between scanlines sets
++ * this to name the source (1 = per-line HDMA, 2 = raster-split IRQ, 3 = the
++ * host's own per-line code) and back to 0 outside the draw loop; every PPU
++ * register write is then counted per source and port. */
++extern int g_ppu_line_write_src;
++extern unsigned long g_ppu_line_writes[4][0x40];
++
++// Ask for the authentic centre to be skipped on the lines where it is safe.
++// See Ppu::wsCentreSkip. Set it per scanline, after PpuSetExtraSpace* (which
++// does not touch it), and only when PpuWidescreenCentreSkipSafe agrees.
++void PpuSetWidescreenCentreSkip(Ppu *ppu, bool skip);
++
++// Whether skipping the centre on scanline `y` leaves the MARGINS unchanged.
++// False whenever something couples a centre pixel to a margin pixel, or
++// whenever a per-line widescreen policy rewrites the span list in a way the
++// split would fight with: horizontal mosaic (it averages across x), the Mode 2
++// offset-per-tile capture, the line enhancer, the split HUD, margin gaps,
++// anchor/elastic/world/repeat/stretch bands and viewport insets. Every one of
++// those is inert in the ordinary case, so this is a handful of scalar loads.
++bool PpuWidescreenCentreSkipSafe(const Ppu *ppu, int y);
++
+ // Render authentic 256-wide content centered within a `budget`-per-side wider
+ // framebuffer (no border columns drawn). For bounded screens; caller blacks
+ // out the side margins to pillarbox.
+diff --git a/runner/src/snes/snes.c b/runner/src/snes/snes.c
+index dc2a034..8ff0b0a 100644
+--- a/runner/src/snes/snes.c
++++ b/runner/src/snes/snes.c
+@@ -251,6 +251,20 @@ void snes_catchup_stats(uint64_t *calls, uint64_t *cycles) {
+   if (cycles) *cycles = s_catchup_cycles_total;
+ }
+ 
++
++#if FZERO_DIAG
++/* TEMPORARY PROBE (Vita-vs-PC APU handshake divergence): capture the first 8
++ * APU-port reads with the guest timestamp that drives apu_runToGuestCycle.
++ * F-Zero's boot spins on CMP $2140 waiting for the SPC IPL to answer $BBAA;
++ * on PC that blocks for ~49.6k iterations, on Vita it matches immediately. */
++struct ApuPortProbe { unsigned adr; unsigned val; unsigned long long master,
++                      frame_start, guest_cycle, port_clock; int frame; };
++struct ApuPortProbe g_apu_port_probe[8];
++unsigned g_apu_port_probe_n = 0;
++unsigned long g_apu_port_reads_total = 0;
++struct ApuPortProbe g_apu_port_last;
++#endif
++
+ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
+   if(adr < 0x40) {
+     return ppu_read(g_ppu, adr);
+@@ -262,6 +276,31 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
+     rtl_sync_apu_to_cpu_locked();
+     uint8_t v = snes->apu->outPorts[adr & 0x3];
+     v = rtl_apu_port_observers_read(0x2100 + adr, v);
++#if FZERO_DIAG
++      g_apu_port_reads_total++;
++      { extern int snes_frame_counter;
++        extern uint64_t rtl_apu_guest_cycle_probe(void);
++        extern uint64_t rtl_apu_frame_start_probe(void);
++        struct ApuPortProbe *L = &g_apu_port_last;
++        L->adr = 0x2100u + adr; L->val = v;
++        L->master = (unsigned long long)g_cpu.master_cycles;
++        L->frame_start = (unsigned long long)rtl_apu_frame_start_probe();
++        L->guest_cycle = (unsigned long long)rtl_apu_guest_cycle_probe();
++        L->port_clock = (unsigned long long)snes->apu->portClock;
++        L->frame = snes_frame_counter; }
++      if (g_apu_port_probe_n < 8) {
++        extern int snes_frame_counter;
++        extern uint64_t rtl_apu_guest_cycle_probe(void);
++        extern uint64_t rtl_apu_frame_start_probe(void);
++        struct ApuPortProbe *e = &g_apu_port_probe[g_apu_port_probe_n++];
++        e->adr = 0x2100u + adr; e->val = v;
++        e->master = (unsigned long long)g_cpu.master_cycles;
++        e->frame_start = (unsigned long long)rtl_apu_frame_start_probe();
++        e->guest_cycle = (unsigned long long)rtl_apu_guest_cycle_probe();
++        e->port_clock = (unsigned long long)snes->apu->portClock;
++        e->frame = snes_frame_counter;
++      }
++#endif
+     audio_trace_on_cpu_port_read((uint8_t)(adr & 0x3), v);
+     RtlApuUnlock();
+     return v;
+diff --git a/runner/src/snes_text_xlate.cpp b/runner/src/snes_text_xlate.cpp
+index 178a0c2..a54e176 100644
+--- a/runner/src/snes_text_xlate.cpp
++++ b/runner/src/snes_text_xlate.cpp
+@@ -311,6 +311,7 @@ uint8_t vram_read_byte(uint32_t byte_addr) {
+ 
+ void vram_write_byte(uint32_t byte_addr, uint8_t value) {
+     uint16_t& word = g_ppu->vram[(byte_addr >> 1) & 0x7fff];
++    g_ppu->vramVersion++;
+     if (byte_addr & 1)
+         word = static_cast<uint16_t>((word & 0x00ffu) |
+                                      (static_cast<uint16_t>(value) << 8));
+diff --git a/runner/src/vita_getenv.c b/runner/src/vita_getenv.c
+new file mode 100644
+index 0000000..99f6550
+--- /dev/null
++++ b/runner/src/vita_getenv.c
+@@ -0,0 +1,57 @@
++/*
++ * vita_getenv.c - Vita-specific getenv wrapper
++ *
++ * On PS Vita, the standard getenv() has a bug that returns 0x812a0000
++ * (a pointer to the .init_array section) instead of NULL for non-existent
++ * environment variables. This causes crashes when the code tries to
++ * dereference the pointer.
++ *
++ * Since Vita doesn't have a real environment like desktop systems,
++ * we wrap the standard getenv() and return NULL for all variables,
++ * disabling debug features on Vita.
++ */
++
++#include <string.h>
++
++/* Forward declaration of the real getenv function */
++extern char *__real_getenv(const char *name);
++
++/* Wrapper for getenv that returns NULL for all variables on Vita.
++ * This disables all debug/diagnostic features that rely on environment
++ * variables, which is appropriate for Vita where there's no real environment.
++ */
++char *__wrap_getenv(const char *name) {
++  /* Special case: SDL_VIDEODRIVER might be checked by SDL2 */
++  if (name && strcmp(name, "SDL_VIDEODRIVER") == 0) {
++    return NULL;  /* Let SDL2 use its default */
++  }
++  
++  /* Special case: SDL_AUDIODRIVER */
++  if (name && strcmp(name, "SDL_AUDIODRIVER") == 0) {
++    return NULL;  /* Let SDL2 use its default */
++  }
++  
++  /* All other environment variables: return NULL to disable features.
++   * This covers all SNESRECOMP_* and SNES_* variables used for
++   * debugging, cosimulation, netplay, etc. - features not needed
++   * in a standard Vita build. */
++  return NULL;
++}
++
++/* Provide a weak alias as well for additional safety */
++/* Note: __attribute__((alias)) is not supported on Darwin/macOS, so we use a
++   function definition there instead. On Vita, the linker will handle the alias. */
++#if defined(__APPLE__) || defined(__MACH__) || defined(__Darwin__)
++/* On macOS/Darwin, aliases are not supported, so provide a function definition */
++char *getenv(const char *name) {
++  return __wrap_getenv(name);
++}
++#elif defined(__vita__) || defined(VITA)
++/* On Vita (real hardware), use weak alias - the Vita linker supports this */
++__attribute__((weak, alias("__wrap_getenv"))) 
++char *getenv(const char *name);
++#else
++/* For other platforms, use weak alias if supported */
++__attribute__((weak, alias("__wrap_getenv"))) 
++char *getenv(const char *name);
++#endif
