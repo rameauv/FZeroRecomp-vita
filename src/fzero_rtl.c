@@ -22,6 +22,7 @@
  *   through the same scheduler bridge: entering at $00:8000 runs boot init,
  *   falls into the loop, and yields at the spin once the flag is cleared.
  */
+#include "fzero_capture_vita.h"
 #include "fzero_rtl.h"
 #include "fzero_layers.h"
 #include "fzero_scene.h"
@@ -323,12 +324,28 @@ static void FZeroLogBailTrace(void) {
 
 #endif  /* FZERO_DIAG */
 
-void FZeroRunOneFrameOfGame(void) {
-  // First-call reset gate (host-side bool, independent of WRAM contents).
-  static bool g_did_reset = false;
-  static bool g_first_frame_done = false;
+/* Boot gate: the reset-vector boot runs once per machine lifetime; every later
+ * frame enters the main loop at its vblank-wait spin ($803A). Both flags are
+ * host state a machine reset does not clear -- FZeroSoftReset() re-arms them
+ * so a soft reset replays the boot exactly like a cold start. */
+static bool g_did_reset = false;
+static bool g_first_frame_done = false;
 
+void FZeroSoftReset(void) {
+  /* RtlReset() resets the machine (WRAM/VRAM/CGRAM/OAM, PPU, DMA, APU, the
+   * emulator CPU) but not this driver's host state: the recomp's g_cpu keeps
+   * its pre-reset registers, and the boot gate above stays closed. Without
+   * re-arming it the per-frame scheduler keeps entering the main-loop spin
+   * over a zeroed machine, so the game's init -- the Mode 7 matrix, the HDMA
+   * tables, the VRAM uploads -- never runs again and the Mode 7 ground stays
+   * broken after the reset. */
+  g_did_reset = false;
+  g_first_frame_done = false;
+}
+
+void FZeroRunOneFrameOfGame(void) {
   if (!g_did_reset) {
+    FZERO_LOG("INFO", "FZero: reset-vector boot (cold start or soft reset)");
     cpu_state_init(&g_cpu, g_ram);
     /* Run boot through the scheduler bridge: reset falls into the
      * main loop and reaches the spin with the NMI flag cleared. */
@@ -434,6 +451,7 @@ void FZeroRunOneFrameOfGame(void) {
            (g_ram[0xc3] == 0x40 ||
             (g_ram[0xc3] == 0x11 && !g_layers->native_oam)));
       FZeroVehiclesPrepare(&g_layers->vehicles, g_ram, g_rom, 0x80000);
+      FZeroCaptureAfterPrepare(g_ram);
     }
     if (g_layers) FZeroGroundPrepare(&g_layers->ground, g_ram);
     /* NMI handler runs BEFORE the main-loop game code each frame. Assert the
@@ -546,7 +564,23 @@ void FZeroDrawPpuFrame(void) {
 #if FZERO_PPUPROF
     uint64_t tp_a = sceKernelGetProcessTimeWide();
 #endif
-    ppu_runLine(g_ppu, i);
+#if FZERO_WIDEPROF
+    uint64_t tw = sceKernelGetProcessTimeWide(), tw_n;
+#define TW_ADD(acc) do { tw_n = sceKernelGetProcessTimeWide(); \
+                         g_wideprof.acc += tw_n - tw; tw = tw_n; \
+                         ++g_wideprof.n_reads; } while (0)
+#else
+#define TW_ADD(acc) ((void)0)
+#endif
+    /* The no-native experiment (g_fzero_wide_nonative). The predicate lives
+     * in fzero_layers.c beside BuildWideLine's matching test, because the two
+     * decisions are made at different moments and a disagreement between them
+     * is a blank centre rather than a slow one. Always true unless the
+     * experiment is on and this line is one the wide pass renders in full. */
+    if (!g_layers || FZeroLayersWantsNativeLine(g_layers, g_ppu, i,
+                                                g_layers->wide_scene))
+        ppu_runLine(g_ppu, i);
+    TW_ADD(t_loop_native);
 #if FZERO_PPUPROF
     uint64_t tp_b = sceKernelGetProcessTimeWide();
     g_fzprof_ppu += tp_b - tp_a;
@@ -562,8 +596,10 @@ void FZeroDrawPpuFrame(void) {
       FZeroLayersProcessLine(g_layers, g_ppu, i,
                             g_layers->wide_scene, g_layers->hud_layout);
     }
+    TW_ADD(t_loop_proc);
     for (int c = 0; c < 8; c++)
       SimpleHdma_DoLine(&hdma_chans[c]);
+    TW_ADD(t_loop_hdma);
 #if FZERO_PPUPROF
     { uint64_t n = sceKernelGetProcessTimeWide(); g_fzprof_hdma += n - tp_b; tp_b = n; }
 #endif
@@ -608,6 +644,8 @@ void FZeroDrawPpuFrame(void) {
 #if FZERO_PPUPROF
     { uint64_t n = sceKernelGetProcessTimeWide(); g_fzprof_split += n - tp_b; }
 #endif
+    TW_ADD(t_loop_irq);
+#undef TW_ADD
   }
 
 #if FZERO_DIAG
@@ -637,8 +675,9 @@ const RtlGameInfo kFZeroGameInfo = {
   .run_frame = &FZeroRunOneFrameOfGame,
   .draw_ppu_frame = &FZeroDrawPpuFrame,
   /* 2 KB battery SRAM (cart header: ROM+RAM+battery, SRAM size 2 KB). The
-   * runner maps it from the header automatically; main_vita.c writes it back
-   * with RtlWriteSram on exit. */
+   * runner maps it from the header automatically. The Vita host calls
+   * RtlSetSaveRoot + RtlReadSram at boot and RtlWriteSram on clean exit,
+   * so battery saves persist across sessions. */
   .save_name_prefix = "save",
   .tier2_capture = 0,
 };

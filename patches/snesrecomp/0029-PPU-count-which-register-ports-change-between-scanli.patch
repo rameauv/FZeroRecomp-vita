@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Tue, 22 Sep 2026 06:43:31 +0900
+Subject: [PATCH 29/33] PPU: count which register ports change between
+ scanlines, and from where
+
+A host that runs the frame's guest code first and renders all 224 lines
+afterwards can only defer its per-line work if it knows what changes per line.
+Measuring that from the HDMA engine alone is incomplete whenever the host also
+dispatches a raster-split IRQ inside its render loop, because that is guest
+code writing registers between scanlines through a path HDMA never touches.
+
+g_ppu_line_write_src lets the host name the source that is currently running
+(per-line HDMA, the raster-split IRQ, its own per-line code) and ppu_write
+charges each register write to it, per port. Zero outside the draw loop, which
+includes the whole vblank CPU half, so the counts are mid-frame only. One
+predictable branch per register write when nothing armed it.
+
+On F-Zero it found exactly the gap it was written for: the raster-split IRQ
+writes $2105 (BGMODE) and $2131 (CGADSUB) mid-frame, neither of which appears
+in the HDMA stream, and a replay without $2105 would draw the whole frame in
+one BG mode -- which is precisely what a raster split exists to avoid.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 18 ++++++++++++++++++
+ runner/src/snes/ppu.h |  6 ++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index ad51cba..1cca622 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -3192,7 +3192,25 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
+   }
+ }
+ 
++/* TEMPORARY PROBE (strategy C): which PPU ports actually change
++ * BETWEEN scanlines, and from where. Session 6 measured the data ports (VRAM,
++ * CGRAM, OAM: zero mid-frame writes, all in vblank) and the HDMA register
++ * stream, and concluded 16 bytes/line would be enough to journal and replay a
++ * deferred wide pass. It did not cover the fourth source: this host dispatches
++ * the raster-split IRQ INLINE in the draw loop (fzero_rtl.c calls
++ * bank_00_8601 at the trigger line), so guest code runs between scanlines and
++ * whatever it writes to $2100-$213F never passed through HDMA.
++ *
++ * The host sets g_ppu_line_write_src to say which source is running; every
++ * write is then charged to it, per port. Off (0) at every other moment, which
++ * includes the whole vblank CPU half, so the counts are mid-frame only.
++ * One predictable branch per register write when the probe is not armed. */
++int g_ppu_line_write_src;                    /* 0 = off / not in the draw loop */
++unsigned long g_ppu_line_writes[4][0x40];    /* [src][port & 0x3f] */
++
+ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
++  if (g_ppu_line_write_src)
++    g_ppu_line_writes[g_ppu_line_write_src & 3][adr & 0x3f]++;
+ //  if (adr != 24 && adr != 25)
+ //    printf("ppu_write(%d, %d)\n", adr, val);
+   switch(adr) {
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 459b880..2f4e337 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -677,6 +677,12 @@ void PpuSetExtraSpace(Ppu *ppu, uint16_t extra);
+ // margin's columns in screen order first, then the right margin's.
+ void PpuSetMode7MarginTiles(Ppu *ppu, const uint8_t *tiles);
+ 
++/* TEMPORARY PROBE, see ppu.c. A host that runs work between scanlines sets
++ * this to name the source (1 = per-line HDMA, 2 = raster-split IRQ, 3 = the
++ * host's own per-line code) and back to 0 outside the draw loop; every PPU
++ * register write is then counted per source and port. */
++extern int g_ppu_line_write_src;
++extern unsigned long g_ppu_line_writes[4][0x40];
+ 
+ // Ask for the authentic centre to be skipped on the lines where it is safe.
+ // See Ppu::wsCentreSkip. Set it per scanline, after PpuSetExtraSpace* (which

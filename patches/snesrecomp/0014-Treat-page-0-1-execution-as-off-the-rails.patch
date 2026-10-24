@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 11:53:57 +0900
+Subject: [PATCH 14/33] Treat page 0/1 execution as off the rails
+
+The bank test alone cannot see a jump into the stack: banks $00-$3F mirror
+WRAM below $2000, so landing at $03:01F1 is a mapped address and looks
+legitimate. Titles that keep no code in page 0 or 1 -- direct page and stack
+only -- are better served by treating that as a crossing, so the approach
+capture names the transfer that produced it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/interp_bridge.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 841f61a..1a389fd 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -1841,6 +1841,13 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+               uint8_t _bank = (uint8_t)(pc_before >> 16);
+               int _mapped = (_bank <= 0x07) || (_bank >= 0x80 && _bank <= 0x87) ||
+                             _bank == 0x7E || _bank == 0x7F;
++              /* Executing in page 0 or 1 is off the rails too, and the bank
++               * test alone never sees it: banks $00-$3F mirror WRAM below
++               * $2000, so a jump into the stack page lands at a *mapped*
++               * address like $03:01F1 and looks legitimate. This title keeps
++               * no code there -- direct page and stack only -- so treat it as
++               * a crossing and capture the approach that produced it. */
++              if ((pc_before & 0xFFFFu) < 0x0200u) _mapped = 0;
+               if (s_prev_mapped && !_mapped)
+                 interp_bridge_note_offrails_vita(s_prev_pc, s_prev_op, s_prev_sp,
+                                                  pc_before, op);

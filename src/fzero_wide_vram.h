@@ -5,15 +5,10 @@
 
 /* Undo journal for the widescreen pass's writes into the scratch PPU's VRAM.
  *
- * BuildWideLine used to memcpy the whole Ppu per scanline, VRAM included, so
- * the scratch started every line byte-identical to the live PPU and any write
- * the wide pass made was wiped by the next line's copy. That copy is 64 KB a
- * line -- 14.7 MB a frame, and on Vita the dominant remaining cost.
- *
- * VRAM is now copied only when the live one actually changes (ppu->vramVersion),
- * which preserves the same invariant by a different route: the wide pass
- * journals what it overwrites and restores it at end of line, so the scratch is
- * again equal to the live VRAM before the next line starts.
+ * VRAM is copied to the scratch only when the live one changes
+ * (ppu->vramVersion), not every line (64 KB a line). To keep the scratch equal
+ * to the live VRAM at the start of each line, the wide pass journals what it
+ * overwrites and restores it at the end of the line.
  *
  * Both writers must go through FZeroWideVramWrite: ExtendPanorama in
  * fzero_layers.c and the ground tile cache in fzero_ground.c. A direct
@@ -23,8 +18,8 @@
  * the offending write is DROPPED rather than applied. That matters now that the
  * target can be the live VRAM: an unjournalled write there would not be a wrong
  * margin pixel, it would be permanent corruption of emulated state. Dropping it
- * makes the worst case cosmetic. Measured high-water is 142 of 512 entries -- the
- * ground's one write per margin pixel -- so this is a net, not a normal path. */
+ * makes the worst case cosmetic. The normal high-water is 142 of 512 entries
+ * (the ground's one write per margin pixel), so overflow is not a normal path. */
 
 enum { kFZeroWideVramJournal = 512 };
 

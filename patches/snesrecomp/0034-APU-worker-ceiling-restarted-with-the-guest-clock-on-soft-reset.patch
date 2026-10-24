@@ -1,0 +1,74 @@
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index 9199d65..8e63803 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -280,6 +280,9 @@ static int16 g_audio_recovery_anchor_r;
+ static int16 g_audio_last_output_l;
+ static int16 g_audio_last_output_r;
+ static void rtl_sync_apu_frame_boundary(void);
++/* Defined beside the worker state below; RtlReset restarts the worker's
++ * ceiling together with the APU guest clock. */
++static void rtl_apu_worker_reset_locked(void);
+ 
+ static uint64_t rtl_apu_guest_cycle(void) {
+   if (g_extended_frame_timing)
+@@ -427,6 +430,12 @@ uint64_t RtlStateGeneration(void) { return s_state_generation; }
+ void RtlReset(int mode) {
+   ++s_state_generation;
+   rtl_reset_host_pacing();
++  /* The APU worker (second core) and the audio callback both touch guest APU
++   * state under RtlApuLock; resetting the guest without it lets a worker
++   * slice or a render block run against a half-reset SPC/DSP -- apu_reset
++   * memsets APU RAM and clears the DSP output ring the callback is draining.
++   * Nothing in the reset path takes the lock itself, so hold it across. */
++  RtlApuLock();
+   snes_reset(g_snes, true);
+   g_snes->beamMasterLast = g_cpu.master_cycles;
+   SnesEnterNativeMode();
+@@ -434,7 +443,6 @@ void RtlReset(int mode) {
+   if (!(mode & 1))
+     memset(g_sram, 0, g_sram_size);
+ 
+-  RtlApuLock();
+   g_audio_fast_forward = false;
+   g_audio_recovery_frames = 0;
+   g_audio_recovery_remaining = 0;
+@@ -442,6 +450,21 @@ void RtlReset(int mode) {
+   g_audio_recovery_anchor_r = 0;
+   g_audio_last_output_l = 0;
+   g_audio_last_output_r = 0;
++  /* The APU guest clock restarts at zero (apu_reset zeroes portClock and
++   * invalidates port time; rtl_reset_host_pacing zeroes snes_frame_counter),
++   * but the worker's ceiling is host-side state this function used to leave
++   * at the pre-reset session's last frame boundary -- hundreds of millions
++   * of SPC cycles into a session that no longer exists. The first post-reset
++   * port write re-validates port time at guest ~0, and the worker then
++   * grinds the SPC toward that stale ceiling with no idle back-off: it races
++   * far ahead of guest time, contending RtlApuLock against the audio
++   * callback for tens of seconds (session-length dependent -- the reported
++   * "audio broken for about 30s after a restart"), and once reached the SPC
++   * sits ahead of every future frame boundary (publishes only raise the
++   * ceiling), so nothing advances it again and the DSP ring drains. Restart
++   * the ceiling with the clock: the worker idles until the first post-reset
++   * frame publishes its boundary, exactly as on a cold boot. */
++  rtl_apu_worker_reset_locked();
+   g_spc_player->initialize(g_spc_player);
+   RtlApuUnlock();
+ }
+@@ -2075,6 +2098,16 @@ static void rtl_apu_worker_publish_locked(uint64_t boundary) {
+   g_apu_worker_busy = 1;
+ }
+ 
++/* RtlReset restarts the APU guest clock at zero, and the worker's ceiling is
++ * a guest frame boundary (see the contract in common_rtl.h), so it restarts
++ * with the clock. Caller holds RtlApuLock. Without this the ceiling keeps the
++ * pre-reset session's boundary and the worker grinds the fresh SPC toward it
++ * -- see the comment in RtlReset. */
++static void rtl_apu_worker_reset_locked(void) {
++  g_apu_worker_target = 0;
++  g_apu_worker_busy = 0;
++}
++
+ #ifdef SNESRECOMP_INTERP_PROFILE
+ #include <time.h>
+ uint64_t apub_prof_calls = 0;

@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 20:10:34 +0900
+Subject: [PATCH 17/33] Widen RecompReturn so the LLE yield sentinel survives
+ short enums
+
+RECOMP_RETURN_LLE_UNWIND_BASE is 0x40000000 and is cast to RecompReturn,
+whose declared enumerators are only 0..3. Under the ARM EABI -fshort-enums
+is the DEFAULT, so GCC packs the enum into one byte and the cast truncates
+the sentinel to 0 -- RECOMP_RETURN_NORMAL.
+
+Every LLE yield unwind was therefore reported to the interpreter as a normal
+return. The paired-call bounce then resumed at its COMPUTED return address
+instead of taking the yield path, stranding the guest return frame it had
+pushed. S stayed 2 bytes low for the rest of the run and an arbitrarily
+distant RTS eventually popped two bytes of another routine's frame.
+
+In this port that surfaced ~46 frames later as $03:8D0B popping $03:038D --
+WRAM -- followed by TXS, a stray XCE into emulation mode, 8-bit M/X, a BRA
+into the middle of a raster band and a shifted RTI. Five layers of cascade
+from one truncated byte.
+
+Measured:
+  arm-vita-eabi-gcc   sizeof(enum{0..3}) = 1   (RecompReturn)0x40000000 = 0
+  x86-64 clang        sizeof(enum{0..3}) = 4   (RecompReturn)0x40000000 = 0x40000000
+
+which is why the identical generated code ran correctly on the desktop build
+and wedged on Vita.
+
+Fixed at the declaration rather than with -fno-short-enums: the defect is a
+value stored in a type that cannot represent it, so it is wrong on any
+packing ABI, not just this one. A build flag would hide it here and leave it
+live for arm-none-eabi and anyone building with -fshort-enums deliberately.
+The static assert makes a regression a compile error instead of a stranded
+return frame tens of frames downstream.
+
+RecompReturn is a return value only -- it appears in no array and no
+ABI-visible struct -- so widening it costs nothing at runtime.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/cpu_state.h | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/runner/src/cpu_state.h b/runner/src/cpu_state.h
+index a96f3a8..9d8bcc5 100644
+--- a/runner/src/cpu_state.h
++++ b/runner/src/cpu_state.h
+@@ -238,8 +238,26 @@ typedef enum RecompReturn {
+     RECOMP_RETURN_SKIP_1 = 1,
+     RECOMP_RETURN_SKIP_2 = 2,
+     RECOMP_RETURN_SKIP_3 = 3,
++    /* NOT a return code. Forces the enum's underlying type wide enough to hold
++     * RECOMP_RETURN_LLE_UNWIND_BASE (0x40000000), which is cast to this type by
++     * interp_bridge_lle_yield_unwind() and friends.
++     *
++     * Without it the declared range is 0..3, and under the ARM EABI -- where
++     * -fshort-enums is the DEFAULT -- GCC packs the enum into a single byte.
++     * The sentinel then truncates to 0 == RECOMP_RETURN_NORMAL, so every LLE
++     * yield unwind is silently reported as a normal return: the interpreter
++     * resumes at its COMPUTED return address instead of taking the yield path,
++     * and the guest return frame it pushed is stranded. S stays low for the
++     * rest of the run and an arbitrarily distant RTS then pops two bytes of
++     * another routine's frame. On x86-64 (int-sized enums) the bug is
++     * invisible, which is why it reproduced only on the Vita build. */
++    RECOMP_RETURN_WIDTH_GUARD = 0x7FFFFFFF,
+ } RecompReturn;
+ 
++/* The sentinel above is only meaningful if the type can hold it. */
++_Static_assert(sizeof(RecompReturn) >= 4,
++               "RecompReturn must be wide enough for RECOMP_RETURN_LLE_UNWIND_BASE");
++
+ /* ── Typed register access ────────────────────────────────────────────────
+  *
+  * The 65816 accumulator/index registers carry semantic width via M/X

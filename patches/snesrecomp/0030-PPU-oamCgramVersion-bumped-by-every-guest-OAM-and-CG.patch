@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Thu, 24 Sep 2026 17:35:20 +0900
+Subject: [PATCH 30/33] PPU: oamCgramVersion, bumped by every guest OAM and
+ CGRAM write
+
+A host that keeps a copy of oam, highOam and cgram across scanlines can
+tell whether it is still current without comparing them. 16 bits, in the
+padding after cgramLutValid, so vram stays the last field with no tail
+padding on ARM.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 3 +++
+ runner/src/snes/ppu.h | 8 ++++++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 1cca622..69b7be3 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -3236,6 +3236,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+       if(ppu->oamInHigh) {
+         int hidx = ((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite;
+         ppu->highOam[hidx] = val;
++        ppu->oamCgramVersion++;
+         debug_server_on_oam_write(1, (uint16_t)hidx, (uint16_t)val);
+         if(ppu->oamSecondWrite) {
+           ppu->oamAdr++;
+@@ -3248,6 +3249,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+           uint16_t widx = ppu->oamAdr;
+           uint16_t word = (uint16_t)((val << 8) | ppu->oamBuffer);
+           ppu->oam[ppu->oamAdr++] = word;
++          ppu->oamCgramVersion++;
+           debug_server_on_oam_write(0, widx, word);
+           if(ppu->oamAdr == 0) ppu->oamInHigh = true;
+         }
+@@ -3375,6 +3377,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+         ppu->cgramBuffer = val;
+       } else {
+         ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
++        ppu->oamCgramVersion++;
+         ppu->cgramLutValid = false;
+       }
+       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 2f4e337..ed27440 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -367,6 +367,14 @@ struct Ppu {
+    * snapshot region: it is derived state, never emulated state. */
+   uint32_t cgramLut[0x100];
+   bool cgramLutValid;
++  /* Bumped by every guest write into oam[], highOam[] or cgram[]. Host-only,
++   * like vramVersion. A host that keeps a copy of those arrays across
++   * scanlines uses it to tell whether the copy is still current. The writers
++   * today are ppu_write's $2104 and $2122; a new writer MUST bump it. 16 bits
++   * so it sits in the padding after cgramLutValid: vram must stay the last
++   * field with no tail padding. A false match needs exactly 65,536 writes
++   * between two checks, and a whole OAM upload is 544. */
++  uint16_t oamCgramVersion;
+ 
+   /* Bumped by every write into vram[]. Host-only and derived, never emulated
+    * state. It exists so a host holding a VRAM copy can tell whether it is

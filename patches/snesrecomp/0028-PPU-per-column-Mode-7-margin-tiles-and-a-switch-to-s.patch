@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Tue, 22 Sep 2026 06:43:21 +0900
+Subject: [PATCH 28/33] PPU: per-column Mode 7 margin tiles, and a switch to
+ skip the centre
+
+Two hooks a widescreen host needs, both drawing-only and both bound for the
+duration of one ppu_runLine, exactly like renderVram.
+
+m7MarginTiles is a borrowed uint8_t per widescreen margin COLUMN. A host that
+widens a Mode 7 view samples course positions the game never uploaded -- the
+128x128 tilemap wraps, so those cells hold tiles from elsewhere -- and until
+now the only channel back into the rasteriser was the tilemap itself. That
+channel is lossy: 16,384 cells are time-shared between the margin columns, so
+two columns on one line can need different tiles from one cell, and a host
+using it has to detect the collision and render the line twice. One slot per
+column cannot collide. It is a per-SPAN choice, not a per-pixel branch: the
+span list is split at x=0 and x=256 and the margin spans get a second copy of
+the inner loop differing only in where the tile number comes from, because
+this is the largest per-pixel loop here and it is already short of registers.
+The out-of-field bypass is kept verbatim -- where (xpos|ypos) > outside_value
+the hardware reads no tilemap cell, so neither tile source may be consulted.
+
+wsCentreSkip marks the authentic 256-wide centre as already drawn, for a host
+that renders the frame twice (once at 256 for the authentic output, once wider
+for the margins) and discards the wider render's centre. Every drawer already
+opens with a test on the span bits, so they convert for free. Two sites do not:
+ClearBackdrop, which becomes two ranges -- both bounds are multiples of 4, so
+they land on the same uint64 stores the single range did -- and the compose
+loop, which cannot take it from the bits because those are the COLOUR window's
+and the margins still read them for clip and colour math. Layer 5 is therefore
+split but never marked, and the compose loop drops the span on its bounds,
+advancing dst past what it did not write.
+
+Splitting a span is exact because every drawer re-seeds its source coordinates
+from win.edges[windex] at the top of each span -- the Mode 7 affine chain
+included -- rather than carrying them across the boundary.
+
+PpuWidescreenCentreSkipSafe decides per scanline whether the skip leaves the
+margins unchanged. It refuses on horizontal mosaic, which averages across x and
+is the only coupling inside the drawers, and on every per-line widescreen
+policy that rewrites the span list. All of those are inert unless a host asked
+for them, so the failure mode when one is not is a slower line, not a wrong one.
+
+Proven byte-identical on the F-Zero host over 2,999 frames spanning 1,707
+distinct wide images and 1,706 distinct native framebuffers, with each hook
+exercised alone and both together.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 132 ++++++++++++++++++++++++++++++++++++++++++
+ runner/src/snes/ppu.h |  43 ++++++++++++++
+ 2 files changed, 175 insertions(+)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 83f9b0e..ad51cba 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -331,6 +331,48 @@ void PpuSetExtraSpace(Ppu *ppu, uint16_t extra) {
+   PpuResetLayerPolicies(ppu);
+ }
+ 
++void PpuSetMode7MarginTiles(Ppu *ppu, const uint8_t *tiles) {
++  ppu->m7MarginTiles = tiles;
++}
++
++void PpuSetWidescreenCentreSkip(Ppu *ppu, bool skip) {
++  ppu->wsCentreSkip = skip ? 1 : 0;
++}
++
++bool PpuWidescreenCentreSkipSafe(const Ppu *ppu, int y) {
++  // There has to BE a margin, or "skip the centre" means "draw nothing".
++  if (!(ppu->extraLeftCur | ppu->extraRightCur))
++    return false;
++  // Horizontal mosaic averages across x, so a margin pixel can be decided by
++  // a centre pixel. This is the only coupling in the drawers themselves.
++  if ((ppu->mosaic & 0x0f) && PPU_mosaicSize(ppu) > 1)
++    return false;
++  // Everything below rewrites the span list per line. None of them is wrong
++  // in principle, but each would have to be reasoned about against the split,
++  // and all are inert unless a host asked for them.
++  if (ppu->widescreenLineEnhancer || ppu->wsMode2CaptureLayer ||
++      ppu->wsHudSplitHeight || ppu->wsHudOamHeight ||
++      ppu->wsWindowExpandLayers)
++    return false;
++  if (PpuWidescreenLineRepeatBandActive(ppu, y))
++    return false;
++  for (unsigned int layer = 0; layer < 4; layer++) {
++    if (ppu->wsMarginGapL[layer] | ppu->wsMarginGapR[layer] |
++        ppu->wsViewportInsetL[layer] | ppu->wsViewportInsetR[layer])
++      return false;
++    if (PpuWidescreenLayerWorldBandAt(ppu, layer, y) >= 0 ||
++        PpuWidescreenLayerElasticBandAt(ppu, layer, y) >= 0)
++      return false;
++    for (unsigned int slot = 0; slot < kPpuWsAnchorBands; slot++) {
++      if (y >= ppu->wsAnchorY0[slot][layer] &&
++          y < ppu->wsAnchorY1[slot][layer] &&
++          ppu->wsAnchorLeftEnd[slot][layer])
++        return false;
++    }
++  }
++  return true;
++}
++
+ void PpuSetExtraSpaceCentered(Ppu *ppu, uint16_t budget) {
+   if (budget > kPpuExtraLeftRight)
+     budget = kPpuExtraLeftRight;
+@@ -693,6 +735,19 @@ static inline void PpuActiveSpan(const Ppu *ppu, size_t *begin,
+ static inline void ClearBackdrop(const Ppu *ppu, PpuPixelPrioBufs *buf) {
+   size_t begin, end;
+   PpuActiveSpan(ppu, &begin, &end);
++  // With the centre skipped nothing writes it and nothing reads it, so
++  // clearing it is 64% of this memset spent on pixels that are discarded.
++  // Both bounds are multiples of 4 (kPpuExtraLeftRight is 272 and kPpuXPixels
++  // 256), so the two ranges land on the same uint64 stores as the whole one.
++  if (ppu->wsCentreSkip) {
++    size_t centre_begin = (size_t)kPpuExtraLeftRight;
++    size_t centre_end = (size_t)kPpuExtraLeftRight + kPpuXPixels;
++    for (size_t i = begin; i < centre_begin; i += 4)
++      *(uint64*)&buf->data[i] = 0x0500050005000500;
++    for (size_t i = centre_end; i < end; i += 4)
++      *(uint64*)&buf->data[i] = 0x0500050005000500;
++    return;
++  }
+   for (size_t i = begin; i < end; i += 4)
+     *(uint64*)&buf->data[i] = 0x0500050005000500;
+ }
+@@ -805,12 +860,42 @@ typedef struct PpuWindows {
+ // clamped to the authentic 256-wide region so a BG3 status bar never tiles into
+ // the margins -- EXCEPT on scanlines >= wsBg3WidenY, where the game renders
+ // level content on BG3 (e.g. SMW water) that should fill 16:9 like BG1/BG2.
++static void PpuWindowsSplit(PpuWindows *win, int16 *bias, int xpos);
++
++// Split the span list at the authentic screen edges and mark everything
++// between them as already drawn. Splitting is exact: every drawer re-seeds its
++// source coordinates from win.edges[windex] at the top of each span -- the
++// Mode 7 affine chain included -- so two spans render the same pixels one
++// span would. Only the bits change what is drawn.
++//
++// LAYER 5 IS THE COLOUR WINDOW and is deliberately left unmarked: the compose
++// loop reads cwin.bits to decide clip and colour-math per span, so setting a
++// bit there would change the MARGINS. The compose loop does its own skip on
++// the span bounds instead, which is why the split still happens for layer 5.
++//
++// The bias array only matters for the per-line policies that use it, and
++// PpuWidescreenCentreSkipSafe refuses the whole scheme when any of those is
++// live -- so the caller's bias is all zeroes and a scratch one is equivalent.
++static void PpuApplyCentreSkip(PpuWindows *win, uint layer) {
++  int16 bias[8] = { 0 };
++  PpuWindowsSplit(win, bias, 0);
++  PpuWindowsSplit(win, bias, kPpuXPixels);
++  if (layer == 5)
++    return;
++  for (uint i = 0; i < win->nr; i++) {
++    if (win->edges[i] >= 0 && win->edges[i + 1] <= kPpuXPixels)
++      win->bits |= (uint8)(1u << i);
++  }
++}
++
+ static void PpuWindows_Clear(PpuWindows *win, Ppu *ppu, uint layer, int y) {
+   win->edges[0] = -PpuWidescreenLayerExtra(ppu, layer, y, ppu->extraLeftCur);
+   win->edges[1] = 256 + PpuWidescreenLayerExtra(ppu, layer, y,
+                                                 ppu->extraRightCur);
+   win->nr = 1;
+   win->bits = 0;
++  if (ppu->wsCentreSkip)
++    PpuApplyCentreSkip(win, layer);
+ }
+ 
+ static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
+@@ -903,6 +988,8 @@ static void PpuWindows_CalcWithExtra(PpuWindows *win, Ppu *ppu, uint layer,
+   } else {
+     win->bits = w1_bits | w2_bits;
+   }
++  if (ppu->wsCentreSkip)
++    PpuApplyCentreSkip(win, layer);
+   debug_server_on_ppu_window(y, (int)layer, win->edges, win->nr, win->bits);
+ }
+ 
+@@ -2011,6 +2098,19 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+    * measure nothing, so its worth is a bg+mode7 delta across builds. */
+   const uint16_t *const m7vram = PpuRenderVram(ppu);
+ #define M7VRAM m7vram
++  /* Host-supplied margin tiles (see Ppu::m7MarginTiles). Splitting the span
++   * list at the authentic screen edges turns "which tile source" from a test
++   * on every pixel into one test per span -- which matters here, because this
++   * is the largest per-pixel loop in the renderer and it is already short of
++   * registers. The split is exact for the same reason the centre skip is: the
++   * affine chain below re-seeds from win.edges[windex] rather than carrying
++   * xpos/ypos across the boundary. */
++  const uint8_t *const m7margin = ppu->m7MarginTiles;
++  if (m7margin && !mosaic_enabled && !ppu->wsCentreSkip) {
++    int16 split_bias[8] = { 0 };
++    PpuWindowsSplit(&win, split_bias, 0);
++    PpuWindowsSplit(&win, split_bias, kPpuXPixels);
++  }
+   for (size_t windex = 0; windex < win.nr; windex++) {
+     if (win.bits & (1 << windex))
+       continue;  // layer is disabled for this window part
+@@ -2041,6 +2141,28 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+           do dstz[i] = pixel + z; while (++i != w);
+         }
+       } while (xpos += dx * w, ypos += dy * w, dstz += w, w = PPU_mosaicSize(ppu), dstz_end - dstz != 0);
++    } else if (m7margin && (x2 <= 0 || x >= kPpuXPixels)) {
++      /* A margin span. The tile number comes from the host's per-column array
++       * instead of the tilemap word; everything else -- the outside-field
++       * test, char fill, the character fetch and the priority store -- is the
++       * loop above, unchanged. The out-of-field branch must still bypass it,
++       * because that is exactly where the hardware does not read a tilemap
++       * cell at all. */
++      const uint8_t *mt = m7margin +
++          (x2 <= 0 ? x + ppu->extraLeftRight
++                   : x - kPpuXPixels + ppu->extraLeftRight);
++      do {
++        if ((uint32)(xpos | ypos) > outside_value) {
++          if (!char_fill)
++            continue;
++          tile = 0;
++        } else {
++          tile = *mt;
++        }
++        uint8 pixel = M7VRAM[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
++        if (pixel)
++          dstz[0] = pixel + z;
++      } while (xpos += dx, ypos += dy, ++mt, ++dstz != dstz_end);
+     } else {
+       do {
+         if ((uint32)(xpos | ypos) > outside_value) {
+@@ -2399,6 +2521,16 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   uint32 windex = 0;
+   do {
+     uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
++    /* The centre skip's second hand-done site (the first is ClearBackdrop).
++     * The drawers take it from the span BITS, but cwin's bits carry clip and
++     * colour-math state that the margins still need, so this span is dropped
++     * on its bounds instead. dst walks with the pixel loop rather than being
++     * indexed, so it has to be advanced past the span that was not written. */
++    if (ppu->wsCentreSkip && left >= (uint32)kPpuExtraLeftRight &&
++        right <= (uint32)(kPpuExtraLeftRight + kPpuXPixels)) {
++      dst += right - left;
++      continue;
++    }
+     /* The per-pixel widescreen-HUD blanking test depends only on i and on
+      * booleans already fixed for this scanline. If no full-width HUD is
+      * active AND this span lies entirely inside the world, it can never
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 9946673..459b880 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -329,6 +329,29 @@ struct Ppu {
+   /* Optional host picture memory. Drawing only: CPU ports and save states
+    * always use vram. The caller owns 32768 words until unbound. */
+   const uint16_t *renderVram;
++  /* Optional host-supplied Mode 7 tilemap IDs for the widescreen margins.
++   * When bound, a Mode 7 pixel whose screen x falls outside [0,256) takes its
++   * tile number from here -- index x+extraLeftRight on the left, and
++   * x-256+extraLeftRight on the right -- instead of from the tilemap word in
++   * picture memory. It exists because a host that widens a Mode 7 view samples
++   * course positions the game never uploaded: the 128x128 tilemap wraps, so
++   * those cells hold tiles from elsewhere. Supplying the correct tile per
++   * MARGIN COLUMN is exact where patching the tilemap is not, because 16,384
++   * cells are time-shared between the margin columns and two columns on one
++   * line can need different tiles from one cell.
++   *
++   * Drawing only, like renderVram: nothing else reads it, and emulated state
++   * is never touched. The caller owns 2*extraLeftRight bytes until unbound. */
++  const uint8_t *m7MarginTiles;
++  /* Skip the authentic 256-wide centre. A host that renders a widened frame
++   * twice -- once at 256 for the authentic output, once wider for the margins
++   * -- discards the wider render's centre. With this set every window span
++   * list is split at x=0 and x=256 and the spans inside that range are marked
++   * as already drawn, so the drawers and the compose loop skip them. Only ever
++   * valid when the caller genuinely discards those pixels; see
++   * PpuWidescreenCentreSkipSafe for the per-line conditions that make the
++   * remaining margins byte-identical. */
++  uint8_t wsCentreSkip;
+   uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
+   uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
+   uint8_t brightnessMult[32 + 31];
+@@ -649,6 +672,26 @@ bool PpuSetOverlayOamRange(Ppu *ppu, uint8_t first, uint8_t count);
+ // extraRightCur/extraLeftRight machinery used by the line renderer.
+ void PpuSetExtraSpace(Ppu *ppu, uint16_t extra);
+ 
++// Bind (or unbind, with NULL) the per-margin-column Mode 7 tile IDs described
++// at Ppu::m7MarginTiles. The array holds 2*extraLeftRight bytes: the left
++// margin's columns in screen order first, then the right margin's.
++void PpuSetMode7MarginTiles(Ppu *ppu, const uint8_t *tiles);
++
++
++// Ask for the authentic centre to be skipped on the lines where it is safe.
++// See Ppu::wsCentreSkip. Set it per scanline, after PpuSetExtraSpace* (which
++// does not touch it), and only when PpuWidescreenCentreSkipSafe agrees.
++void PpuSetWidescreenCentreSkip(Ppu *ppu, bool skip);
++
++// Whether skipping the centre on scanline `y` leaves the MARGINS unchanged.
++// False whenever something couples a centre pixel to a margin pixel, or
++// whenever a per-line widescreen policy rewrites the span list in a way the
++// split would fight with: horizontal mosaic (it averages across x), the Mode 2
++// offset-per-tile capture, the line enhancer, the split HUD, margin gaps,
++// anchor/elastic/world/repeat/stretch bands and viewport insets. Every one of
++// those is inert in the ordinary case, so this is a handful of scalar loads.
++bool PpuWidescreenCentreSkipSafe(const Ppu *ppu, int y);
++
+ // Render authentic 256-wide content centered within a `budget`-per-side wider
+ // framebuffer (no border columns drawn). For bounded screens; caller blacks
+ // out the side margins to pillarbox.

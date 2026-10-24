@@ -1,0 +1,5 @@
+/* Opaque black, as SDL_RenderClear with colour 0,0,0,255 gave. */
+float4 main() : COLOR
+{
+    return float4(0.0f, 0.0f, 0.0f, 1.0f);
+}

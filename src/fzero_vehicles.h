@@ -13,6 +13,7 @@ typedef struct FZeroVehicle {
     uint16_t oam[16], high;
     uint16_t graphics[512];
     unsigned graphics_address;
+    unsigned graphics_words;   /* words of each 256-word row the pose uses */
 } FZeroVehicle;
 
 typedef struct FZeroVehicles {
@@ -21,6 +22,10 @@ typedef struct FZeroVehicles {
     uint16_t shadow_oam[24];
     uint8_t shadow_high[3];
     unsigned shadow_count;
+    /* Which car each shadow belongs to. Additive placement needs it: the game
+     * already draws the shadows of the cars it draws, so only the shadows of
+     * reconstructed cars may be added. */
+    uint8_t shadow_car[12];
     int jump_anchor_y[6];
     bool jump_anchor_valid[6];
     unsigned long projected, matched, added_left, added_right;

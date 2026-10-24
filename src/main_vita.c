@@ -1,27 +1,16 @@
-/*
- * main_vita.c - PS Vita main entry point for FZeroRecomp
- *
- * Runs the full game loop:
- *   - Continuous frame loop
- *   - Controller input handling
- *   - Audio output
- *   - Proper frame timing
- *   - Clean quit handling
- *
- * Based on patterns from sm64-vita's pc_main.c
- */
+/* main_vita.c - PS Vita entry point and game loop for FZeroRecomp. */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
 
-#include <SDL.h>
-#include <SDL_video.h>
-#include <SDL_render.h>
+#define SDL_ENABLE_OLD_NAMES
+#include <SDL3/SDL.h>
 
 #include "platform.h"
 #include "snes/snes.h"
+#include "fzero_capture_vita.h"
 #include "snes/ppu.h"
 #include "snes/cpu.h"
 #include "snes/apu.h"
@@ -29,37 +18,36 @@
 #include "common_cpu_infra.h"
 #include "common_rtl.h"
 #include "fzero_rtl.h"
-#if FZERO_WIDESCREEN
 #include "fzero_layers.h"
-#endif
 #include "rom_image_verify.h"
 #include "input_vita.h"
 #include "audio_sdl.h"
 #include "apu_worker.h"
 #include "fzero_spc_player.h"
+#include "fzero_gpu_ground.h"
+#include "gxm_present.h"
 #include "funcs.h"
 #include <signal.h>
+#include <psp2/power.h>
+#include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/threadmgr/callback.h>
 
-/* PS Vita heap size configuration (64 MB) */
+/* 64 MB heap. */
 unsigned int _newlib_heap_size_user = 64 * 1024 * 1024;
 
-/* External declarations from common_rtl.c */
 extern Ppu *g_ppu;
 extern Snes *g_snes;
 extern const RtlGameInfo *g_rtl_game_info;
 
-/* Vita screen dimensions */
 #define VITA_SCREEN_WIDTH  960
 #define VITA_SCREEN_HEIGHT 544
 
-/* SNES native resolution */
 #define SNES_WIDTH  256
 #define SNES_HEIGHT 224
 
-/* ROM path for Vita */
 #define ROM_PATH FZERO_ROM_PATH
 
-/* Alternative ROM paths to try for development/testing */
+/* Searched in order. */
 static const char *rom_paths[] = {
     ROM_PATH,                                    /* ux0:/data/fzero_recomp/fzero.sfc */
     "ux0:/data/fzero_recomp/F-Zero (USA).sfc",  /* Alternative filename */
@@ -69,38 +57,16 @@ static const char *rom_paths[] = {
     NULL
 };
 
-/* Pixel buffer for PPU output */
 static uint8_t g_pixels[SNES_WIDTH * SNES_HEIGHT * 4];
 
-#if FZERO_WIDESCREEN
-/* Widescreen bring-up. The whole per-line pipeline already exists in this tree
- * and in fzero_rtl.c -- everything runs under `if (g_layers)` -- and the only
- * reason it has never executed on Vita is that nothing called FZeroSetLayers.
- * This wires it up so the cost can be MEASURED on device instead of projected.
- *
- * Expect it to be slow. PC puts BuildWideLine at ~1,949 us/frame even after
- * the scratch-copy reduction, and Vita's rasteriser runs roughly 10x slower, so the
- * honest expectation is well past the 16,639 us budget. The point of this
- * build is the number, not the frame rate.
- *
- * Presentation is deliberately the simple thing: the layered world/hud pair
- * that the desktop host keeps apart (so it can filter them differently) is
- * flattened into one ARGB image here. They are complementary by construction
- * in BuildWideLine -- a pixel is in exactly one of them, and hud carries an
- * opaque alpha -- so flattening loses nothing except the ability to treat them
- * differently, which this bring-up does not do. */
+/* The wide layers. The per-line pipeline in fzero_rtl.c runs under
+ * `if (g_layers)`, so it is on only after FZeroSetLayers. The Vita presents
+ * one flat ARGB image: fzero_layers.c composites straight into layers->flat. */
 static FZeroLayers *g_layers_vita;
-static uint32_t g_wide_pixels[FZERO_LAYER_HEIGHT * FZERO_WIDE_WIDTH];
+/* Chosen at boot with a system dialog (InitAll), so one VPK runs both ways. */
+static bool g_widescreen;
 
-static void FlattenWideFrame(void) {
-    const uint32_t *w = (const uint32_t *)g_layers_vita->wide_world;
-    const uint32_t *h = (const uint32_t *)g_layers_vita->wide_hud;
-    for (size_t i = 0; i < FZERO_LAYER_HEIGHT * (size_t)FZERO_WIDE_WIDTH; ++i)
-        g_wide_pixels[i] = (h[i] & 0xff000000u) ? (h[i] & 0x00ffffffu) : w[i];
-}
-#endif
-
-/* Expected SHA-256 of F-Zero (USA) ROM */
+/* SHA-256 of F-Zero (USA). */
 static const uint8_t expected_sha256[32] = {
     0xbf, 0x16, 0xc3, 0xc8, 0x67, 0xc5, 0x8e, 0x2a,
     0xb0, 0x61, 0xc7, 0x0d, 0xe9, 0x29, 0x5b, 0x69,
@@ -108,34 +74,22 @@ static const uint8_t expected_sha256[32] = {
     0xf5, 0xec, 0xae, 0x03, 0xe0, 0xad, 0x18, 0xd2,
 };
 
-/* Frame timing */
 static uint64_t g_frame_start_time = 0;
-/* True SNES NTSC frame period, matching the PC host's FZERO_GAME_PERIOD_NS
- * (16639264 ns = 60.0988 Hz). The previous 1000000/60 (16666 us) paced the
- * guest 0.16% slow, which alone is not the vPos drift but is a real error and
- * must be out of the way before pacing can be judged. */
+/* The SNES NTSC frame period: 16,639,264 ns = 60.0988 Hz, as on the PC host
+ * (FZERO_GAME_PERIOD_NS). */
 static const uint64_t g_frame_time_us = 16639;
-
-/* ========================================================================
- * GLOBAL STATE
- * ======================================================================== */
 
 static bool g_running = true;
 static SDL_Window *g_window = NULL;
-static SDL_Renderer *g_renderer = NULL;
-static SDL_Texture *g_texture = NULL;
 
-/* --- presentation measurement -------------------------------------------
- * Always on: ~7 timer reads per frame, one log line per 60 frames.
- *
- * FrameTiming() caps the loop at ~60 Hz, so the capped FPS number says
- * nothing about headroom -- what costs what only shows up as per-phase busy
- * time. That breakdown is what chose the renderer below, and it is what any
- * future frame-time work will be judged against, so it stays in.
- */
-static int    g_renderer_mode = -1;      /* 0 = software, 1 = accelerated */
+/* Per-phase frame timing. Always on: about 7 timer reads per frame, one log
+ * line per 60 frames. The loop is capped at ~60 Hz, so the FPS figure does not
+ * show headroom; the per-phase busy time does. */
 static uint64_t g_acc_cpu, g_acc_draw, g_acc_aud, g_acc_upl, g_acc_clr, g_acc_cpy, g_acc_pre;
-static uint64_t g_acc_flat;  /* widescreen world/hud flatten, its own phase */
+static uint64_t g_acc_flat;
+/* This frame's own phase times, so the breakdown of an over-budget frame can
+ * be logged without extra timer reads. */
+static uint64_t g_frame_cpu_us, g_frame_draw_us, g_frame_aud_us, g_frame_upl_us, g_frame_cpy_us;
 
 /* Draw-loop split, accumulated in fzero_rtl.c. */
 extern uint64_t g_fzprof_ppu, g_fzprof_hdma, g_fzprof_split;
@@ -148,48 +102,182 @@ extern uint64_t g_apuprof_us; extern uint32_t g_apuprof_calls;
 extern uint64_t g_apuprof_port_us, g_apuprof_frame_us;
 extern uint32_t g_apuprof_port_calls, g_apuprof_frame_calls;
 extern uint64_t g_fzprof_nmi, g_fzprof_sched;
-/* Sprite range-evaluation early-out: measured at 853 us/frame, kept on. The
- * switch stays so it can be A/B'd again if the OAM walk is reworked. */
+/* Sprite range-evaluation early-out. On by default. */
 extern int g_ppu_fast_sprite_eval;
-/* Compose-loop widescreen-HUD hoist: measured at 1568 us/frame, kept on. */
+/* Compose-loop widescreen-HUD hoist. On by default. */
 extern int g_ppu_fast_compose;
-#ifndef FZERO_PPU_LUT_AB
-/* 1 = alternate the compose-LUT arm every 300 frames, for a measurement
- * build. Default 0: the shipping build just runs the fast arm. */
-#define FZERO_PPU_LUT_AB 0
-#endif
 /* Compose palette table (ppu->cgramLut): the per-pixel cgram load, three
  * brightnessMult lookups and two shifts become one load and one store.
- * Proven pixel-exact on PC over 3,999 frames / 2,520 distinct images, and
- * PC coverage counters put 81%% of compose pixels on the table path with the
- * original per-pixel loop never executing at all. Unmeasured on device --
- * FZERO_PPU_LUT=ab. */
+ * Pixel-exact. */
 extern int g_ppu_fast_cgram_lut;
 
+#if FZERO_COREBENCH
+/* Does a second core help memory-bound work? Vita3K cannot answer this: it
+ * JITs to x86 with a different memory system. The cold arm of MemcpyBench (a
+ * source rotating through 8 buffers, so nothing stays in L2) runs on core 0
+ * alone, then again with an identical loop on core 2. Reports both cores'
+ * throughput and the aggregate:
+ *
+ *   scaling 2.0x   the bus is not the limit
+ *   scaling 1.0x   the bus is the limit; moving work to another core only
+ *                  moves the cost
+ *
+ * Both arms consume their destination so the optimiser cannot delete the
+ * loop. Startup only; does not touch the game. */
+enum { kCB_NSrc = 8 };
+static volatile int g_cb_run;       /* neighbour: keep going */
+static volatile int g_cb_ready;     /* neighbour: warmed up and streaming */
+static volatile uint32_t g_cb_sink; /* consumed, so nothing is optimised out */
+static volatile uint64_t g_cb_bytes;/* what the neighbour actually moved */
+
+static size_t CoreBenchStream(char **src, char *dst, size_t n, int iters) {
+    uint32_t sum = 0;
+    for (int i = 0; i < iters; ++i) {
+        memcpy(dst, src[i % kCB_NSrc], n);
+        sum += (uint32_t)(unsigned char)dst[i & 1023];
+    }
+    g_cb_sink += sum;
+    return (size_t)iters * n;
+}
+
+static int CoreBenchNeighbour(void *unused) {
+    (void)unused;
+    int rc = sceKernelChangeThreadCpuAffinityMask(0, SCE_KERNEL_CPU_MASK_USER_2);
+    int mask = sceKernelGetThreadCpuAffinityMask(0);
+    FZERO_LOG("INFO", "corebench: neighbour on %#x (rc=%d)", (unsigned)mask, rc);
+    const size_t n = sizeof(Ppu);
+    char *src[kCB_NSrc], *dst = malloc(n);
+    int ok = dst != NULL;
+    for (int i = 0; i < kCB_NSrc; ++i) {
+        src[i] = malloc(n);
+        if (!src[i]) ok = 0; else memset(src[i], (char)(0x11 + i), n);
+    }
+    if (!ok) { FZERO_LOG("WARN", "corebench: neighbour alloc failed"); return 1; }
+    CoreBenchStream(src, dst, n, 32);           /* warm */
+    uint64_t moved = 0, t0 = sceKernelGetProcessTimeWide();
+    g_cb_ready = 1;
+    while (g_cb_run) moved += CoreBenchStream(src, dst, n, 64);
+    uint64_t dt = sceKernelGetProcessTimeWide() - t0;
+    g_cb_bytes = dt ? (moved * 1000000ull) / dt : 0;   /* B/s */
+    free(dst);
+    for (int i = 0; i < kCB_NSrc; ++i) free(src[i]);
+    return 0;
+}
+
+static void CoreBench(void) {
+    const size_t n = sizeof(Ppu);
+    char *src[kCB_NSrc], *dst = malloc(n);
+    int ok = dst != NULL;
+    for (int i = 0; i < kCB_NSrc; ++i) {
+        src[i] = malloc(n);
+        if (!src[i]) ok = 0; else memset(src[i], (char)(0x5a + i), n);
+    }
+    if (!ok) { FZERO_LOG("WARN", "corebench: alloc failed"); return; }
+    /* apu_worker_start() pins the game thread to core 0; log what it is
+     * instead of assuming the pin succeeded. */
+    FZERO_LOG("INFO", "corebench: this thread on %#x, %u KB per copy",
+              (unsigned)sceKernelGetThreadCpuAffinityMask(0),
+              (unsigned)(n / 1024));
+    enum { kIters = 512 };
+    CoreBenchStream(src, dst, n, 64);                      /* warm */
+
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    size_t moved = CoreBenchStream(src, dst, n, kIters);
+    uint64_t alone_us = sceKernelGetProcessTimeWide() - t0;
+    uint64_t alone_bs = alone_us ? ((uint64_t)moved * 1000000ull) / alone_us : 0;
+
+    g_cb_run = 1; g_cb_ready = 0; g_cb_bytes = 0;
+    SDL_Thread *th = SDL_CreateThread(CoreBenchNeighbour, "cb", NULL);
+    if (!th) { FZERO_LOG("WARN", "corebench: no neighbour thread"); goto done; }
+    while (!g_cb_ready) SDL_Delay(1);                      /* let it get going */
+    t0 = sceKernelGetProcessTimeWide();
+    moved = CoreBenchStream(src, dst, n, kIters);
+    uint64_t shared_us = sceKernelGetProcessTimeWide() - t0;
+    uint64_t shared_bs = shared_us ? ((uint64_t)moved * 1000000ull) / shared_us : 0;
+    g_cb_run = 0;
+    SDL_WaitThread(th, NULL);
+
+    uint64_t agg = shared_bs + g_cb_bytes;
+    FZERO_LOG("INFO",
+        "corebench: core0 ALONE %u MB/s | core0 SHARED %u MB/s (%u%%)"
+        " | core2 %u MB/s | AGGREGATE %u MB/s = %u.%02ux one core",
+        (unsigned)(alone_bs >> 20), (unsigned)(shared_bs >> 20),
+        (unsigned)(alone_bs ? shared_bs * 100 / alone_bs : 0),
+        (unsigned)(g_cb_bytes >> 20), (unsigned)(agg >> 20),
+        (unsigned)(alone_bs ? agg / alone_bs : 0),
+        (unsigned)(alone_bs ? (agg * 100 / alone_bs) % 100 : 0));
+    FZERO_LOG("INFO",
+        "corebench: sink=%u (consumed so the copies cannot be deleted)",
+        (unsigned)g_cb_sink);
+done:
+    free(dst);
+    for (int i = 0; i < kCB_NSrc; ++i) free(src[i]);
+}
+#endif
+
+#if FZERO_GPUBENCH
+#include <psp2/kernel/sysmem.h>
+/* The CPU read of one margin buffer (2 x 71 x 224 ARGB, 127 KB) out of each
+ * memory type a GXM render target can use, for reading GPU output back.
+ * Cached main memory is the baseline only: GPU writes to it need a cache
+ * invalidate that user mode cannot request. Startup only; does not touch the
+ * game. */
+enum { kGB_W = 142, kGB_H = 224, kGB_Iters = 60 };
+
+static void GpuBenchRead(const char *name, SceUInt32 type, void *dst) {
+    const SceSize n = kGB_W * kGB_H * 4, sz = 256 * 1024;
+    SceUID uid = sceKernelAllocMemBlock("gpubench", type, sz, NULL);
+    if (uid < 0) {
+        FZERO_LOG("WARN", "gpubench: read[%s] alloc failed %#x", name, (unsigned)uid);
+        return;
+    }
+    void *src = NULL;
+    sceKernelGetMemBlockBase(uid, &src);
+    memset(src, 0x5a, n);
+    uint32_t sum = 0;
+    uint64_t best = ~0ull, total = 0;
+    for (int i = 0; i < kGB_Iters; ++i) {
+        uint64_t t0 = sceKernelGetProcessTimeWide();
+        memcpy(dst, src, n);
+        uint64_t dt = sceKernelGetProcessTimeWide() - t0;
+        sum += ((const uint32_t *)dst)[i * 97];
+        total += dt;
+        if (dt < best) best = dt;
+    }
+    FZERO_LOG("INFO",
+              "gpubench: read[%s] %u B mean=%llu us min=%llu us = %u MB/s | chk=%08x",
+              name, (unsigned)n, (unsigned long long)(total / kGB_Iters),
+              (unsigned long long)best,
+              (unsigned)(total ? (uint64_t)n * kGB_Iters * 1000000ull / total >> 20 : 0),
+              (unsigned)sum);
+    sceKernelFreeMemBlock(uid);
+}
+
+static void GpuBench(void) {
+    uint32_t *dst = malloc(kGB_W * kGB_H * 4);
+    if (!dst) { FZERO_LOG("WARN", "gpubench: alloc failed"); return; }
+    GpuBenchRead("main-cached ", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, dst);
+    GpuBenchRead("main-nc     ", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE, dst);
+    GpuBenchRead("phycont-nc  ", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, dst);
+    GpuBenchRead("cdram       ", SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW, dst);
+
+    FZERO_LOG("INFO", "gpubench: the margin render it would replace costs 7420 us/frame");
+    free(dst);
+}
+#endif
+
 #if FZERO_MEMBENCH
-/* What does BuildWideLine's per-scanline `memcpy(copy, ppu, sizeof(*copy))`
- * actually cost on THIS machine?
+/* The cost of BuildWideLine's per-scanline `memcpy(copy, ppu, sizeof(*copy))`
+ * on this machine. The working set (~400 KB) is close to the ~512 KB L2, so a
+ * bandwidth calculation cannot predict it. Two arms, 224 copies each (one
+ * frame):
  *
- * It cannot be measured in situ: widescreen is unwired on Vita (FZeroSetLayers
- * has no caller, g_layers is NULL), so BuildWideLine never runs. And it cannot
- * be predicted: the working set is ~400 KB of source+destination against a
- * ~512 KB L2, exactly the regime where a bandwidth calculation is worthless.
- * An estimate made that way was 3x too pessimistic on PC, because the same src
- * and dst are reused every line and largely stay cached.
+ *   hot   one src, one dst, reused: the real access pattern. A lower bound.
+ *   cold  src rotates through 8 buffers (1.6 MB, past L2), dst stays put.
+ *         An upper bound.
  *
- * Two arms, each 224 copies -- one frame's worth -- and NEITHER needs a
- * subtraction, which is what broke the first version of this probe:
- *
- *   hot   one src, one dst, reused -- exactly the real access pattern, with
- *         the cache as friendly as it can possibly be. A LOWER bound.
- *   cold  src rotates through 8 buffers (1.6 MB, comfortably past L2) so every
- *         copy reads memory that cannot still be cached, while dst stays put.
- *         An UPPER bound, and it costs nothing extra to measure -- no eviction
- *         walk to time and subtract.
- *
- * The first version also reported hot=1 us for 44 MB, because nothing consumed
- * dst and the whole loop was optimised away. The checksum below exists to stop
- * that; it is logged so it cannot be dead-code eliminated either. */
+ * The checksum consumes dst so the optimiser cannot delete the loop, and it
+ * is logged so it is not dead code either. */
 static void MemcpyBench(void) {
     enum { kLines = 224, kNSrc = 8, kSkip = 114688, kRegs = 5400 };
     const size_t kFull = sizeof(Ppu);
@@ -230,9 +318,8 @@ done:
 }
 #endif
 
-/* Cost of one sceKernelGetProcessTimeWide(), measured at startup. The draw-loop
- * probe adds three reads per scanline (~675/frame), so its own overhead has to
- * be a reported number rather than an assumption. */
+/* Cost of one sceKernelGetProcessTimeWide(), measured at startup, so the
+ * probes can report their own overhead. */
 static uint32_t g_timer_ns;
 static void CalibrateTimer(void) {
     enum { N = 20000 };
@@ -250,9 +337,20 @@ static uint64_t s_w_slices, s_w_idle, s_w_late;
 static uint64_t g_acc_sleep;
 static uint32_t g_acc_over, g_acc_frames;
 
+/* Per-frame phase breakdown, captured only for frames that miss budget: it
+ * shows whether the overrun is in cpu, draw (which includes the ground GPU
+ * acquire wait) or upl (the present-texture wait). Capped per window. */
+#define FZ_OVER_CAP 4
+static struct {
+    uint32_t idx;  /* 1..60: which frame in the window */
+    uint64_t cpu, draw, aud, upl, cpy;
+} g_over_detail[FZ_OVER_CAP];
+static uint32_t g_over_detail_n;
+
 static void ResetPhaseAccumulators(void) {
     g_acc_cpu = g_acc_draw = g_acc_aud = g_acc_upl = g_acc_clr = g_acc_cpy = g_acc_pre = 0;
     g_acc_flat = 0;
+    g_over_detail_n = 0;
     g_fzprof_ppu = g_fzprof_hdma = g_fzprof_split = 0; g_fzprof_lines = 0;
     g_ppuprof_eval = g_ppuprof_bg = g_ppuprof_compose = 0;
     g_apuprof_us = 0; g_apuprof_calls = 0;
@@ -263,86 +361,98 @@ static void ResetPhaseAccumulators(void) {
     g_acc_over = g_acc_frames = 0;
 }
 
-static void LogRendererInfo(const char *tag) {
-    SDL_RendererInfo info;
-    if (SDL_GetRendererInfo(g_renderer, &info) != 0) {
-        FZERO_LOG("WARN", "renderer[%s]: SDL_GetRendererInfo failed: %s", tag, SDL_GetError());
-        return;
-    }
-    FZERO_LOG("INFO", "renderer[%s]: name=%s flags=0x%08X%s%s%s%s max=%dx%d nformats=%d",
-              tag, info.name ? info.name : "?", (unsigned int)info.flags,
-              (info.flags & SDL_RENDERER_SOFTWARE)      ? " SOFTWARE"      : "",
-              (info.flags & SDL_RENDERER_ACCELERATED)   ? " ACCELERATED"   : "",
-              (info.flags & SDL_RENDERER_PRESENTVSYNC)  ? " PRESENTVSYNC"  : "",
-              (info.flags & SDL_RENDERER_TARGETTEXTURE) ? " TARGETTEXTURE" : "",
-              info.max_texture_width, info.max_texture_height,
-              (int)info.num_texture_formats);
-    for (Uint32 i = 0; i < info.num_texture_formats && i < 8u; ++i)
-        FZERO_LOG("INFO", "renderer[%s]: texture_format[%u]=%s", tag, (unsigned int)i,
-                  SDL_GetPixelFormatName(info.texture_formats[i]));
-}
-
-/*
- * Create (or recreate) the renderer and the SNES frame texture.
- * mode 0 = SDL_RENDERER_SOFTWARE, 1 = SDL_RENDERER_ACCELERATED (the
- * default: measured at 1.07 ms/frame of presentation against the software
- * path's 105 ms).
- *
- * The original code fell back to flags 0 on failure, which degrades
- * SILENTLY -- that is exactly how you measure software and call it
- * hardware. Here every fallback is logged and the mode actually obtained is
- * confirmed with SDL_GetRendererInfo().
- */
-static bool SelectRenderer(int mode) {
-    const char *tag = mode ? "ACCEL" : "SOFT";
-    Uint32 flags = mode ? SDL_RENDERER_ACCELERATED : SDL_RENDERER_SOFTWARE;
-
-    if (g_texture)  { SDL_DestroyTexture(g_texture);   g_texture = NULL; }
-    if (g_renderer) { SDL_DestroyRenderer(g_renderer); g_renderer = NULL; }
-
-    g_renderer = SDL_CreateRenderer(g_window, -1, flags);
-    if (!g_renderer) {
-        FZERO_LOG("WARN", "renderer[%s]: SDL_CreateRenderer failed: %s", tag, SDL_GetError());
-        if (mode != 0) {
-            mode = 0; tag = "SOFT";
-            g_renderer = SDL_CreateRenderer(g_window, -1, SDL_RENDERER_SOFTWARE);
-        }
-        if (!g_renderer) {
-            FZERO_LOG("ERROR", "renderer: no renderer available at all: %s", SDL_GetError());
-            return false;
-        }
-    }
-
-#if FZERO_WIDESCREEN
-    g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
-                                  SDL_TEXTUREACCESS_STREAMING,
-                                  FZERO_WIDE_WIDTH, FZERO_LAYER_HEIGHT);
-#else
-    g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888,
-                                  SDL_TEXTUREACCESS_STREAMING, SNES_WIDTH, SNES_HEIGHT);
-#endif
-    if (!g_texture) {
-        FZERO_LOG("ERROR", "renderer[%s]: SDL_CreateTexture failed: %s", tag, SDL_GetError());
-        return false;
-    }
-
-    g_renderer_mode = mode;
-    LogRendererInfo(tag);
-    ResetPhaseAccumulators();
-    return true;
-}
-
 static Snes *g_snes_instance = NULL;
 static uint8_t *g_rom_buffer = NULL;
 static long g_rom_size = 0;
 
-/* ========================================================================
- * ROM HANDLING
- * ======================================================================== */
+/* FNV-1a over the battery SRAM, used to detect changes for the periodic
+ * auto-save below. */
+static uint32_t SramHash(void) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; g_sram && i < g_sram_size; i++) {
+        h ^= g_sram[i];
+        h *= 16777619u;
+    }
+    return h;
+}
 
-/*
- * Verify ROM against expected SHA-256
- */
+static uint32_t s_last_saved_sram_hash;
+static int s_have_saved_sram_hash;
+
+/* Write battery SRAM to disk and record its hash, so the auto-save below
+ * only writes again when the content actually changed. */
+static void SaveSram(void) {
+    if (!g_snes_instance) return;
+    s_last_saved_sram_hash = SramHash();
+    s_have_saved_sram_hash = 1;
+    RtlWriteSram();
+}
+
+/* Power callback: saves battery SRAM when the app is suspended (PS button
+ * pressed or closed from LiveArea). SDL3's Vita backend does not deliver
+ * SDL_QUIT for these events, so we use a ScePower callback instead.
+ * Saving on resume as well covers the case where the suspend callback was
+ * missed (e.g. the PS button suspend fired while the callback thread was
+ * busy): the write is idempotent, so doing it twice is harmless. */
+static SceUID g_power_cb_id = -1;
+static SceUID g_callback_thread_id = -1;
+
+static int PowerCallback(int notifyId, int notifyCount, int powerInfo, void *userData) {
+    (void)notifyId; (void)notifyCount; (void)userData;
+    if (powerInfo & SCE_POWER_CB_APP_SUSPEND) {
+        FZERO_LOG("INFO", "App suspend: writing battery SRAM");
+        SaveSram();
+    } else if (powerInfo & SCE_POWER_CB_APP_RESUME) {
+        FZERO_LOG("INFO", "App resume: writing battery SRAM");
+        SaveSram();
+    }
+    return 0;
+}
+
+static int CallbackThread(SceSize args, void *argp) {
+    (void)args; (void)argp;
+    g_power_cb_id = sceKernelCreateCallback("FZero Power Callback", 0, PowerCallback, NULL);
+    if (g_power_cb_id >= 0) {
+        scePowerRegisterCallback(g_power_cb_id);
+        FZERO_LOG("INFO", "Power callback registered (id=%d)", g_power_cb_id);
+    } else {
+        FZERO_LOG("WARN", "Failed to create power callback (id=%d)", g_power_cb_id);
+    }
+    /* This thread only handles callbacks: delay forever with CB so callbacks fire.
+     * 1 s poll so the thread exits promptly when g_running goes false. */
+    while (g_running) {
+        sceKernelDelayThreadCB(1 * 1000 * 1000); /* 1 s */
+    }
+    return 0;
+}
+
+static void StartPowerCallback(void) {
+    /* 16 KB stack: the callback calls FZERO_LOG (1 KB stack buffer in
+     * platform_vita_log) and RtlWriteSram (fopen/fwrite/fclose), which
+     * together overflow a 4 KB stack. */
+    g_callback_thread_id = sceKernelCreateThread("fzero_cb", CallbackThread,
+                                                  0x10000100, 0x4000, 0, 0, NULL);
+    if (g_callback_thread_id >= 0) {
+        sceKernelStartThread(g_callback_thread_id, 0, NULL);
+    } else {
+        FZERO_LOG("WARN", "Failed to create callback thread (id=%d)", g_callback_thread_id);
+    }
+}
+
+static void StopPowerCallback(void) {
+    if (g_power_cb_id >= 0) {
+        scePowerUnregisterCallback(g_power_cb_id);
+        sceKernelDeleteCallback(g_power_cb_id);
+        g_power_cb_id = -1;
+    }
+    if (g_callback_thread_id >= 0) {
+        /* The thread checks g_running, so setting it false (done by caller)
+         * lets it exit. Wait for it. */
+        sceKernelWaitThreadEnd(g_callback_thread_id, NULL, NULL);
+        g_callback_thread_id = -1;
+    }
+}
+
 static bool VerifyRom(const char *path) {
     const char *driver = getenv("SDL_VIDEODRIVER");
     if (getenv("SNESRECOMP_MAX_FRAMES") || (driver && !strcmp(driver, "dummy"))) {
@@ -351,10 +461,6 @@ static bool VerifyRom(const char *path) {
     return snesrecomp_rom_verify_sha256(path, expected_sha256) != 0;
 }
 
-/*
- * Read entire file into buffer
- * Uses Vita platform file reading
- */
 static uint8_t *ReadWholeFile(const char *path, long *size_out) {
     void *buffer = NULL;
     size_t file_size = 0;
@@ -370,47 +476,11 @@ static uint8_t *ReadWholeFile(const char *path, long *size_out) {
     return NULL;
 }
 
-/* ========================================================================
- * INITIALIZATION
- * ======================================================================== */
-
-/*
- * Initialize all subsystems
- */
-static bool InitAll(void) {
-    /* Initialize platform */
-    platform_init();
-    platform_ensure_directories();
-
-    /* Initialize SDL with VIDEO first */
-    FZERO_LOG("INFO", "Initializing SDL2");
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        FZERO_LOG("ERROR", "SDL_Init(VIDEO) failed: %s", SDL_GetError());
-        return false;
-    }
-    
-    /* Initialize other subsystems that might be needed for input
-     * This ensures keyboard/mouse function pointers are initialized
-     * (required for keybinds.c which calls SDL_GetScancodeFromName) */
-    SDL_InitSubSystem(SDL_INIT_JOYSTICK);
-    SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
-
-    /* Create window at Vita native resolution */
-    FZERO_LOG("INFO", "Creating window at %dx%d", VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
-    g_window = SDL_CreateWindow("F-Zero Recomp (Vita)",
-                                          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                          VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT,
-                                          SDL_WINDOW_FULLSCREEN);
-    if (!g_window) {
-        FZERO_LOG("ERROR", "SDL_CreateWindow failed: %s", SDL_GetError());
-        return false;
-    }
-
-    CalibrateTimer();
-#if FZERO_WIDESCREEN
-    /* ~2 MB, so it is heap-allocated rather than static: the text segment has
-     * ~1 KB of slack and .bss is not the constraint, but a 2 MB static would
-     * still be the wrong shape for something this build-optional. */
+/* Allocate the wide layers and hand them to the RTL. Without this call the
+ * whole widescreen pass stays off (everything in it runs under
+ * `if (g_layers)`). */
+static bool EnableWidescreen(void) {
+    /* ~2 MB, so heap-allocated. */
     g_layers_vita = calloc(1, sizeof(*g_layers_vita));
     if (!g_layers_vita) {
         FZERO_LOG("ERROR", "widescreen: could not allocate %u bytes of layers",
@@ -418,39 +488,67 @@ static bool InitAll(void) {
         return false;
     }
     FZeroSetLayers(g_layers_vita);
-    FZERO_LOG("INFO", "widescreen: ON, %ux%u, layers=%u KB (MEASUREMENT build)",
+    g_widescreen = true;
+    FZERO_LOG("INFO", "widescreen: ON, %ux%u, layers=%u KB",
               (unsigned int)FZERO_WIDE_WIDTH, (unsigned int)FZERO_LAYER_HEIGHT,
               (unsigned int)(sizeof(*g_layers_vita) / 1024));
+    return true;
+}
+
+static bool InitAll(void) {
+    platform_init();
+    platform_ensure_directories();
+
+    FZERO_LOG("INFO", "Initializing SDL3");
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        FZERO_LOG("ERROR", "SDL_Init(VIDEO) failed: %s", SDL_GetError());
+        return false;
+    }
+
+    /* keybinds.c calls SDL_GetScancodeFromName, which needs the keyboard
+     * function pointers these subsystems set up. */
+    SDL_InitSubSystem(SDL_INIT_JOYSTICK);
+    SDL_InitSubSystem(SDL_INIT_GAMEPAD);
+
+    FZERO_LOG("INFO", "Creating window at %dx%d", VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT);
+    g_window = SDL_CreateWindow("F-Zero Recomp (Vita)",
+                                VITA_SCREEN_WIDTH, VITA_SCREEN_HEIGHT,
+                                SDL_WINDOW_FULLSCREEN);
+    if (!g_window) {
+        FZERO_LOG("ERROR", "SDL_CreateWindow failed: %s", SDL_GetError());
+        return false;
+    }
+
+    CalibrateTimer();
+#if FZERO_CAPTURE
+    FZeroCaptureInit();
 #endif
 #if FZERO_MEMBENCH
     MemcpyBench();
 #endif
 
-    /* Enumerate what render drivers this SDL build actually has, before
-     * asking for one -- so a missing GXM driver is visible as such rather
-     * than as a mysteriously slow "hardware" path. */
-    int ndrivers = SDL_GetNumRenderDrivers();
-    FZERO_LOG("INFO", "render drivers: %d", ndrivers);
-    for (int i = 0; i < ndrivers; ++i) {
-        SDL_RendererInfo di;
-        if (SDL_GetRenderDriverInfo(i, &di) == 0)
-            FZERO_LOG("INFO", "render driver[%d]: name=%s flags=0x%08X%s%s%s",
-                      i, di.name ? di.name : "?", (unsigned int)di.flags,
-                      (di.flags & SDL_RENDERER_SOFTWARE)     ? " SOFTWARE"     : "",
-                      (di.flags & SDL_RENDERER_ACCELERATED)  ? " ACCELERATED"  : "",
-                      (di.flags & SDL_RENDERER_PRESENTVSYNC) ? " PRESENTVSYNC" : "");
-        else
-            FZERO_LOG("WARN", "render driver[%d]: query failed: %s", i, SDL_GetError());
-    }
-
     FZERO_LOG("INFO", "Creating renderer and SNES frame texture");
-    if (!SelectRenderer(1)) return false;
+    /* The game owns GXM, so no SDL renderer is created: SDL's would call
+     * sceGxmInitialize first. */
+    /* The texture is allocated for the wide frame, and shrunk if the player
+     * says No. The dialog needs GXM up, so it comes after the init. */
+    if (!GxmPresentInit(FZERO_WIDE_WIDTH, FZERO_LAYER_HEIGHT)) return false;
+    int answer = GxmPresentAskYesNo("Enable widescreen?");
+    FZERO_LOG("INFO", "widescreen dialog: %s",
+              answer > 0 ? "Yes" : answer == 0 ? "No" : "cancelled or failed");
+    if (answer > 0) {
+        if (!EnableWidescreen()) return false;
+    } else if (!GxmPresentSetSourceSize(SNES_WIDTH, SNES_HEIGHT)) {
+        return false;
+    }
+    ResetPhaseAccumulators();
+#if FZERO_GPUBENCH
+    GpuBench();
+#endif
 
-    /* Initialize input */
     FZERO_LOG("INFO", "Initializing controller input");
     input_init();
 
-    /* Initialize audio */
     FZERO_LOG("INFO", "Initializing audio");
     if (!audio_init()) {
         FZERO_LOG("WARN", "Audio initialization failed, continuing without audio");
@@ -459,11 +557,7 @@ static bool InitAll(void) {
     return true;
 }
 
-/*
- * Load ROM and initialize SNES
- */
 static bool LoadAndInitSNES(void) {
-    /* Try to find ROM at multiple locations */
     const char *rom_path = NULL;
     FZERO_LOG("INFO", "Searching for ROM file...");
     for (int i = 0; rom_paths[i] != NULL; i++) {
@@ -490,7 +584,6 @@ static bool LoadAndInitSNES(void) {
         return false;
     }
 
-    /* Load ROM */
     FZERO_LOG("INFO", "Loading ROM from: %s", rom_path);
     g_rom_size = 0;
     g_rom_buffer = ReadWholeFile(rom_path, &g_rom_size);
@@ -500,11 +593,9 @@ static bool LoadAndInitSNES(void) {
     }
     FZERO_LOG("INFO", "ROM loaded: %ld bytes", g_rom_size);
 
-    /* Initialize SNES emulation */
     FZERO_LOG("INFO", "Registering game");
     RtlRegisterGame(&kFZeroGameInfo);
 
-    /* Initialize SPC player */
     FZERO_LOG("INFO", "Initializing SPC player");
     g_spc_player = FZeroSpcPlayer_Create();
     if (g_spc_player && g_spc_player->initialize) {
@@ -512,6 +603,7 @@ static bool LoadAndInitSNES(void) {
     }
 
     FZERO_LOG("INFO", "Initializing SNES");
+    RtlSetSaveRoot(FZERO_SAVES_PATH);
     g_snes_instance = SnesInit(g_rom_buffer, (int)g_rom_size);
     if (!g_snes_instance) {
         FZERO_LOG("ERROR", "SnesInit failed");
@@ -520,39 +612,34 @@ static bool LoadAndInitSNES(void) {
         return false;
     }
     FZERO_LOG("INFO", "SNES initialized successfully");
+
+    /* Load battery SRAM from ux0:/data/fzero_recomp/saves/save.srm.
+     * Must run after SnesInit so g_sram/g_sram_size are set. */
+    RtlReadSram();
+    FZERO_LOG("INFO", "Battery SRAM loaded");
+
+    /* Start the power callback thread so SRAM is saved on app suspend
+     * (PS button or close from LiveArea). */
+    StartPowerCallback();
 #if FZERO_DIAG
     FZERO_LOG("INFO", "  Sinit after SnesInit S=%04X e=%d",
               (unsigned int)g_cpu.S, (int)g_cpu.emulation);
 #endif
 
-    /* No bounce exclusions needed. The two targets that appeared to "leak" a
-     * return frame ($00:F806 and $03:8062) were in fact yielding correctly --
-     * their yield sentinel was being truncated to RECOMP_RETURN_NORMAL by the
-     * ARM EABI's short-enum packing of RecompReturn. Fixed at the type in
-     * snesrecomp/runner/src/cpu_state.h. */
+    /* No bounce exclusions are needed. $00:F806 and $03:8062 yield correctly
+     * because RecompReturn has a fixed width (snesrecomp/runner/src/cpu_state.h);
+     * with ARM EABI short enums the yield sentinel was truncated. */
 
-    /* Deliberately NOT calling RtlEnableExtendedFrameTiming() here. It is only
-     * ever called from snesrecomp's desktop/host_main.c, which NEITHER build
-     * links -- the PC target has its own main.c too. Enabling it on Vita was
-     * tested and had no effect on the wedge or the vPos drift, and it made the
-     * Vita host diverge from the working PC reference, so it stays off. */
+    /* RtlEnableExtendedFrameTiming() is not called: the PC reference build
+     * does not call it either, and the Vita host must match it. */
 
-    /* Begin PPU drawing */
     FZERO_LOG("INFO", "Starting PPU drawing");
     PpuBeginDrawing(g_ppu, g_pixels, (size_t)SNES_WIDTH * 4, kPpuRenderFlags_NewRenderer);
 
     return true;
 }
 
-/* ========================================================================
- * GAME LOOP
- * ======================================================================== */
-
-/*
- * Handle one frame of game logic
- */
 static void HandleFrame(void) {
-    /* Poll SDL events */
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT) {
@@ -563,15 +650,33 @@ static void HandleFrame(void) {
 
     /* Sample the pad once; everything below reads that one sample. */
     input_poll();
+#if FZERO_CAPTURE
+    if (g_widescreen) FZeroCapturePoll();
+#endif
 
-    /* Check for quit (START + SELECT held) before building the frame's input */
-    if (input_should_quit()) {
-        FZERO_LOG("INFO", "Quit combo held, exiting");
-        g_running = false;
+    /* L + R + START held soft-resets the SNES (preserves battery SRAM).
+     * F-Zero sometimes locks up with no way back to the title screen. */
+    if (input_should_reset()) {
+        FZERO_LOG("INFO", "Soft reset (L+R+START)");
+        RtlReset(1);
+        /* Re-arm the frame driver's boot gate so the game's reset-vector boot
+         * re-runs (Mode 7 matrix, HDMA tables, VRAM uploads included). */
+        FZeroSoftReset();
         return;
     }
 
-    /* Read input */
+    /* START + SELECT held writes battery SRAM to disk on demand: a
+     * deterministic save path that does not depend on the suspend callback. */
+    if (input_should_save()) {
+        FZERO_LOG("INFO", "Manual save (START+SELECT): writing battery SRAM");
+        if (g_snes_instance) {
+            SaveSram();
+            int64_t sz = platform_file_size(FZERO_SAVES_PATH "save.srm");
+            FZERO_LOG("INFO", "Manual save: %s is %lld bytes",
+                      FZERO_SAVES_PATH "save.srm", (long long)sz);
+        }
+    }
+
     uint32_t inputs = input_read();
 
     static uint32_t s_frame_count = 0;
@@ -582,10 +687,24 @@ static void HandleFrame(void) {
         FZERO_LOG("INFO", ">>> Frame %u starting...", (unsigned int)s_frame_count);
     }
 
+    /* Auto-save battery SRAM about once a second whenever its content
+     * changes. Closing the app from LiveArea kills the process without
+     * SDL_QUIT, and the suspend callback's save can be missed or cut short
+     * by the kill, so without a periodic save a hard close loses every
+     * record since boot. The hash check keeps the 2 KB write off storage
+     * unless the game actually wrote SRAM (boot init, record updates), so
+     * any exit path -- LiveArea close, PS suspend, power off, crash -- now
+     * loses at most about a second of records. Runs on the game thread
+     * between frames, where SRAM is stable. */
+    if (s_frame_count % 60 == 0 && g_snes_instance) {
+        uint32_t h = SramHash();
+        if (!s_have_saved_sram_hash || h != s_last_saved_sram_hash)
+            SaveSram();
+    }
+
     uint64_t t_phase = sceKernelGetProcessTimeWide();
     const uint64_t t_frame_begin = t_phase;
 
-    /* Run game frame */
 #if FZERO_DIAG
     {
       extern int snes_frame_counter;
@@ -595,29 +714,26 @@ static void HandleFrame(void) {
     }
 #endif
     RtlRunFrame(inputs);
-    { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_cpu += n - t_phase; t_phase = n; }
+    { uint64_t n = sceKernelGetProcessTimeWide(); uint64_t d = n - t_phase;
+      g_acc_cpu += d; g_frame_cpu_us = d; t_phase = n; }
 
 #if FZERO_DIAG
-    /* Per-frame WRAM fingerprint, for bisecting guest-state divergence against
-     * the PC reference. Same point in the frame as PC's probe (immediately
-     * after the CPU half, before draw_ppu_frame) and the same crc32 over the
-     * same 128K, so the two columns are directly comparable. */
+    /* Per-frame WRAM CRC, at the same point in the frame as the PC probe
+     * (after the CPU half, before draw_ppu_frame), over the same 128 KB, so
+     * the two logs compare directly. */
     {
       extern uint32_t crc32_compute(const uint8_t *data, size_t len);
       extern int snes_frame_counter;
       if (snes_frame_counter <= 120)
         FZERO_LOG("INFO", "  ramcrc f%d=%08X", snes_frame_counter,
                   (unsigned int)crc32_compute(g_ram, 0x20000));
-      /* WRAM diverges from PC at frame 2. Localise it: per-4K-page CRCs on the
-       * first few frames say WHICH region differs, so only that region needs a
-       * byte dump. 32 lines per frame, three frames. */
+      /* Per-4 KB-page CRCs for the first frames, to find which region
+       * differs. 32 lines per frame, three frames. */
       if (snes_frame_counter >= 1 && snes_frame_counter <= 3)
         for (int pg = 0; pg < 32; ++pg)
           FZERO_LOG("INFO", "  rampg f%d p%02d=%08X", snes_frame_counter, pg,
                     (unsigned int)crc32_compute(g_ram + pg * 0x1000, 0x1000));
-      /* Page 0 localisation done: Vita's stack sits 2 bytes deeper than PC's.
-       * Now pin WHEN those 2 bytes appear. PC idles at S=01FF before every
-       * frame's NMI push; Vita idles at 01FD. */
+      /* Stack pointer before each frame's NMI push. PC idles at S=01FF. */
       if (snes_frame_counter <= 6)
         FZERO_LOG("INFO", "  Safter f%d S=%04X e=%d", snes_frame_counter,
                   (unsigned int)g_cpu.S, (int)g_cpu.emulation);
@@ -628,7 +744,6 @@ static void HandleFrame(void) {
         FZERO_LOG("INFO", ">>> Frame %u: RtlRunFrame done", (unsigned int)s_frame_count);
     }
 
-    /* Draw PPU frame */
     if (g_rtl_game_info && g_rtl_game_info->draw_ppu_frame) {
         if (s_frame_count <= 10) {
             FZERO_LOG("INFO", ">>> Frame %u: draw_ppu_frame...", (unsigned int)s_frame_count);
@@ -636,7 +751,6 @@ static void HandleFrame(void) {
         g_rtl_game_info->draw_ppu_frame();
         if (s_frame_count <= 10) {
             FZERO_LOG("INFO", ">>> Frame %u: draw_ppu_frame done", (unsigned int)s_frame_count);
-            /* Diagnose PPU state: forced blank, brightness, layer enables */
             FZERO_LOG("INFO", ">>> Frame %u: PPU inidisp=0x%02X (forcedBlank=%d, brightness=%d)",
                       (unsigned int)s_frame_count,
                       (unsigned int)g_ppu->inidisp,
@@ -646,7 +760,7 @@ static void HandleFrame(void) {
                       (unsigned int)s_frame_count,
                       (unsigned int)g_ppu->screenEnabled[0],
                       (unsigned int)g_ppu->screenEnabled[1]);
-            /* Sample a few pixels to see if anything non-black was drawn */
+            /* Is anything non-black drawn? */
             uint32_t *px = (uint32_t *)g_pixels;
             uint32_t nonzero = 0;
             for (int _pi = 0; _pi < SNES_WIDTH * SNES_HEIGHT; ++_pi)
@@ -656,45 +770,39 @@ static void HandleFrame(void) {
         }
     }
 
-    { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_draw += n - t_phase; t_phase = n; }
-
-    /* Submit audio */
-    audio_render_frame(g_snes_instance);
-    { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_aud += n - t_phase; t_phase = n; }
-
-    /* Upload pixels to texture */
-#if FZERO_WIDESCREEN
-    /* Timed on its own. Folding it into upl= made the upload look 5.9x more
-     * expensive than the 1.55x pixel increase can explain, which is a probe
-     * artifact, not a finding. */
-    FlattenWideFrame();
-    { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_flat += n - t_phase; t_phase = n; }
-    SDL_Rect update_rect = {0, 0, FZERO_WIDE_WIDTH, FZERO_LAYER_HEIGHT};
-    SDL_UpdateTexture(g_texture, &update_rect, g_wide_pixels, FZERO_WIDE_WIDTH * 4);
-#else
-    SDL_Rect update_rect = {0, 0, SNES_WIDTH, SNES_HEIGHT};
-    SDL_UpdateTexture(g_texture, &update_rect, g_pixels, SNES_WIDTH * 4);
+    { uint64_t n = sceKernelGetProcessTimeWide(); uint64_t d = n - t_phase;
+      g_acc_draw += d; g_frame_draw_us = d; t_phase = n; }
+#if FZERO_CAPTURE
+    if (g_widescreen) FZeroCaptureEndFrame(g_layers_vita, g_ppu, s_frame_count);
 #endif
-    { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_upl += n - t_phase; t_phase = n; }
 
-    /* Clear screen */
-    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
-    SDL_RenderClear(g_renderer);
+    audio_render_frame(g_snes_instance);
+    { uint64_t n = sceKernelGetProcessTimeWide(); uint64_t d = n - t_phase;
+      g_acc_aud += d; g_frame_aud_us = d; t_phase = n; }
+
+    if (g_widescreen) {
+        /* flat= is kept in the log format. It should read ~0. */
+        { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_flat += n - t_phase; t_phase = n; }
+        GxmPresentUpload(&g_layers_vita->flat[0][0], FZERO_WIDE_WIDTH);
+    } else {
+        GxmPresentUpload((const uint32_t *)g_pixels, SNES_WIDTH);
+    }
+    { uint64_t n = sceKernelGetProcessTimeWide(); uint64_t d = n - t_phase;
+      g_acc_upl += d; g_frame_upl_us = d; t_phase = n; }
+
+    /* GXM clears inside its scene, in cpy= below. clr= stays in the log
+     * format. */
     { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_clr += n - t_phase; t_phase = n; }
 
-    /* Render texture */
     SDL_Rect dest_rect;
     
-    /* Calculate aspect-ratio-correct scaling */
-#if FZERO_WIDESCREEN
-    float snes_aspect = (float)FZERO_WIDE_WIDTH / (float)FZERO_LAYER_HEIGHT;
-#else
+    /* Aspect-correct destination rectangle. */
     float snes_aspect = (float)SNES_WIDTH / (float)SNES_HEIGHT;
-#endif
+    if (g_widescreen)
+        snes_aspect = (float)FZERO_WIDE_WIDTH / (float)FZERO_LAYER_HEIGHT;
     float screen_aspect = (float)VITA_SCREEN_WIDTH / (float)VITA_SCREEN_HEIGHT;
     
     if (screen_aspect > snes_aspect) {
-        /* Screen is wider than SNES - pillbox horizontally */
         int height = VITA_SCREEN_HEIGHT;
         int width = (int)(height * snes_aspect);
         dest_rect.x = (VITA_SCREEN_WIDTH - width) / 2;
@@ -702,7 +810,6 @@ static void HandleFrame(void) {
         dest_rect.w = width;
         dest_rect.h = height;
     } else {
-        /* Screen is taller than SNES - pillbox vertically */
         int width = VITA_SCREEN_WIDTH;
         int height = (int)(width / snes_aspect);
         dest_rect.x = 0;
@@ -711,109 +818,16 @@ static void HandleFrame(void) {
         dest_rect.h = height;
     }
 
-    SDL_RenderCopy(g_renderer, g_texture, NULL, &dest_rect);
-    { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_cpy += n - t_phase; t_phase = n; }
-
-    /* Present to screen */
-    SDL_RenderPresent(g_renderer);
+    /* Its own scene, queued ahead of the present scene. Counted in cpy=. */
+    if (g_widescreen) FZeroGpuGroundEndFrame(&g_layers_vita->flat[0][0], FZERO_WIDE_WIDTH);
+    /* Scene and flip together: cpy= is the whole GPU submission, pre= is 0. */
+    GxmPresentDraw(dest_rect.x, dest_rect.y, dest_rect.w, dest_rect.h);
+    { uint64_t n = sceKernelGetProcessTimeWide(); uint64_t d = n - t_phase;
+      g_acc_cpy += d; g_frame_cpy_us = d; t_phase = n; }
     { uint64_t n = sceKernelGetProcessTimeWide(); g_acc_pre += n - t_phase; t_phase = n; }
     g_acc_frames++;
     (void)t_frame_begin;
 
-    /* A/B the worker inside ONE run, alternating every 300 frames, so both
-     * arms see nearly the same scenes and consecutive blocks can be compared
-     * directly. Pooling arms across a run charges scene drift to the change:
-     * bg+mode7 swings 3,830-5,672 us WITHIN an arm.
-     *
-     * OFF by default: the arm is already decided. Measured over 139 clean
-     * blocks, worker ON is 5,835 us/frame cheaper and takes 47.9 -> 59.5 FPS
-     * with late=0 for the whole run. The lever stays so the next change to
-     * the APU path can be measured the same way -- FZERO_APU_WORKER=ab. */
-    {
-        static int s_ab = -1;
-        if (s_ab < 0) {
-            const char *e = getenv("FZERO_APU_WORKER");
-            s_ab = (e && e[0] == 'a') ? 1 : 0;
-        }
-        if (s_ab && s_frame_count % 300 == 0) {
-            bool on = !apu_worker_enabled();
-            apu_worker_set(on);
-            FZERO_LOG("INFO", "A/B: APU worker -> %s at f%u",
-                      on ? "ON" : "off", (unsigned int)s_frame_count);
-        }
-    }
-
-    /* Same lever for the compose palette table, and for the same reason: the
-     * arms must alternate INSIDE one run so consecutive 300-frame blocks can
-     * be compared. bg+mode7 does not move with this change, so it doubles as
-     * the drift check -- a saving that shows up anywhere but compose and the
-     * total is a measurement artifact, not a win. FZERO_PPU_LUT=ab. */
-    {
-        static int s_ab = -1;
-        if (s_ab < 0) {
-            /* A Vita launch has no environment -- getenv is always NULL
-             * here -- so the arm has to come from the build. The env check
-             * stays for the desktop build of this file. */
-            const char *e = getenv("FZERO_PPU_LUT");
-            s_ab = (e && e[0] == 'a') ? 1 : FZERO_PPU_LUT_AB;
-        }
-        if (s_ab && s_frame_count % 300 == 0) {
-            g_ppu_fast_cgram_lut = !g_ppu_fast_cgram_lut;
-            FZERO_LOG("INFO", "A/B: compose LUT -> %s at f%u",
-                      g_ppu_fast_cgram_lut ? "LUT" : "orig",
-                      (unsigned int)s_frame_count);
-        }
-    }
-
-#if FZERO_WIDE_SHAREDCOPY_AB
-    /* Same lever again, for the scratch copy CaptureSprites and MoveWideHud do.
-     * PC says removing that copy is a net LOSS there -- the memcpy prefetches
-     * for the ppu_runLine right after it, and PC has the cache to profit. The
-     * startup membench says this machine has neither the bandwidth
-     * nor the cache, so the two should disagree. This decides it on device. */
-    {
-
-        if (s_frame_count % 300 == 0) {
-            g_fzero_wide_sharedcopy = !g_fzero_wide_sharedcopy;
-            FZERO_LOG("INFO", "A/B: wide scratch copy -> %s at f%u",
-                      g_fzero_wide_sharedcopy ? "SHARED" : "full",
-                      (unsigned int)s_frame_count);
-        }
-    }
-#endif
-
-#if FZERO_WIDE_MOVEHUD_AB
-    /* The centred-HUD concession. Unlike every other lever here this one is
-     * NOT an equivalence: it deliberately changes the picture, leaving the HUD
-     * in the original 256 band instead of spreading it to the screen edges.
-     * WIDECRC differing between these arms is the expected result, not a bug. */
-    {
-        if (s_frame_count % 300 == 0) {
-            g_fzero_wide_movehud = !g_fzero_wide_movehud;
-            FZERO_LOG("INFO", "A/B: wide HUD -> %s at f%u",
-                      g_fzero_wide_movehud ? "SPREAD" : "CENTRED",
-                      (unsigned int)s_frame_count);
-        }
-    }
-#endif
-
-#if FZERO_WIDE_FASTCOV_AB
-    /* Same lever, for the 704 coverage renders. Unlike the scratch copy this
-     * one removes work outright rather than trading memory traffic for
-     * locality, so PC and Vita should agree in sign -- PC measured
-     * ProcessLine 9,142 -> 2,780 us/frame. If they disagree here, something
-     * other than the render count dominates. */
-    {
-        if (s_frame_count % 300 == 0) {
-            g_fzero_wide_fastcov = !g_fzero_wide_fastcov;
-            FZERO_LOG("INFO", "A/B: wide coverage -> %s at f%u",
-                      g_fzero_wide_fastcov ? "SLOTS" : "render",
-                      (unsigned int)s_frame_count);
-        }
-    }
-#endif
-
-    /* Frame telemetry / heartbeat logging */
     if (s_frame_count == 1) {
         FZERO_LOG("INFO", "First frame rendered successfully!");
         s_last_fps_time = sceKernelGetProcessTimeWide();
@@ -830,7 +844,7 @@ static void HandleFrame(void) {
                   "Heartbeat: f%u %s ~%.1f FPS | emu=%u [cpu=%u draw=%u] aud=%u"
                   " | present=%u [upl=%u clr=%u cpy=%u pre=%u] flat=%u"
                   " | busy=%u sleep=%u over=%u n=%u",
-                  (unsigned int)s_frame_count, g_renderer_mode ? "ACCEL" : "SOFT", fps,
+                  (unsigned int)s_frame_count, "GXM", fps,
                   (unsigned int)((g_acc_cpu + g_acc_draw) / n),
                   (unsigned int)(g_acc_cpu / n), (unsigned int)(g_acc_draw / n),
                   (unsigned int)(g_acc_aud / n),
@@ -840,6 +854,18 @@ static void HandleFrame(void) {
                   (unsigned int)(g_acc_flat / n),
                   (unsigned int)(busy / n), (unsigned int)(g_acc_sleep / n),
                   (unsigned int)g_acc_over, (unsigned int)n);
+        /* Phase breakdown of the first frames that missed budget in this
+         * window. wf = which frame in the window, 1..60. */
+        for (uint32_t oi = 0; oi < g_over_detail_n; ++oi)
+            FZERO_LOG("INFO",
+                      "  over[%u]: wf=%u cpu=%u draw=%u aud=%u upl=%u cpy=%u",
+                      (unsigned int)oi, (unsigned int)g_over_detail[oi].idx,
+                      (unsigned int)g_over_detail[oi].cpu,
+                      (unsigned int)g_over_detail[oi].draw,
+                      (unsigned int)g_over_detail[oi].aud,
+                      (unsigned int)g_over_detail[oi].upl,
+                      (unsigned int)g_over_detail[oi].cpy);
+        FZeroGpuGroundReport();
         /* APU catch-up: the measured part of cpu=. apuprobe= is this probe's
          * own cost. */
         /* cpu= attributed. The APU sync is nested INSIDE nmi/sched, so it is
@@ -856,19 +882,14 @@ static void HandleFrame(void) {
                   (unsigned int)(g_apuprof_port_calls / n),
                   (unsigned int)(g_apuprof_frame_us / n),
                   (unsigned int)(g_apuprof_frame_calls / n));
-        /* APU worker health, in one line so one device round-trip settles it:
+        /* APU worker health:
          *   late=  frames whose previous ceiling was still unreached at
-         *          publish time -- the worker is behind real time. 0 is the
-         *          goal; a steady nonzero count means the second core cannot
-         *          keep up and the projection is wrong.
-         *   occ=   DSP ring occupancy in natives, sampled once per block --
-         *          evidence, not a bound. The servo steers toward 2136 (4
-         *          frames of 534) and holds it once the frame pacer is
-         *          honest; what actually went wrong is counted by the
-         *          apu-audio line below, which is the one to read.
-         * Both are cumulative counters printed per 60-frame block, so compare
-         * CONSECUTIVE blocks -- pooling arms charges scene drift to the
-         * change. */
+         *          publish time: the worker is behind real time. 0 is the
+         *          goal.
+         *   occ=   DSP ring occupancy in natives, sampled once per block. The
+         *          servo steers toward 2136 (4 frames of 534). The apu-audio
+         *          line below counts the actual faults.
+         * Both are cumulative counters printed per 60-frame block. */
         {
             uint64_t wslices = 0, widle = 0, wlate = 0;
             rtl_apu_worker_stats(&wslices, &widle, &wlate);
@@ -915,17 +936,15 @@ static void HandleFrame(void) {
                   g_acc_cpu ? 100.0 * (double)g_apuprof_us / (double)g_acc_cpu : 0.0,
                   (unsigned int)((g_timer_ns * 2u * (g_apuprof_calls / n)) / 1000u));
 #if FZERO_PPUPROF
-        /* The draw half, attributed. probe= is this probe's own cost, so the
-         * reader can tell measurement from measured. */
+        /* The draw half, attributed. probe= is this probe's own cost. */
         FZERO_LOG("INFO",
                   "  draw-split: ppu_runLine=%u hdma=%u irq_split=%u | lines=%u/frame"
                   " probe=%u (us/frame)",
                   (unsigned int)(g_fzprof_ppu / n), (unsigned int)(g_fzprof_hdma / n),
                   (unsigned int)(g_fzprof_split / n), (unsigned int)(g_fzprof_lines / n),
                   (unsigned int)((g_timer_ns * 8u * (g_fzprof_lines / n)) / 1000u));
-        /* All three measured directly, never derived by subtraction -- the
-         * upstream profiler's compose-by-subtraction is exactly how a phase
-         * with no probes gets silently absorbed into another. sum= is the
+        /* All three are measured directly, not derived by subtraction, so a
+         * phase with no probe cannot hide inside another. sum= is the
          * cross-check against ppu_runLine above. */
         FZERO_LOG("INFO",
                   "  ppu-phases[compose=%s/%s]: spriteEval=%u bg+mode7=%u compose=%u"
@@ -938,24 +957,30 @@ static void HandleFrame(void) {
                   (unsigned int)(g_fzprof_ppu / n));
 #endif
 #if FZERO_WIDEPROF
-        /* The widescreen layers pass, attributed. `hdma=` above CONTAINS this
-         * whole pass when widescreen is on; these lines are
-         * what is inside it. bytes= is the number that ports -- the membench
-         * measured this machine at ~1 GB/s with caching worth only 25-35%. */
+        /* The widescreen layers pass, attributed. `hdma=` above contains this
+         * whole pass when widescreen is on. */
         {
             uint64_t cap = g_wideprof.t_cap_copy + g_wideprof.t_cap_run
                          + g_wideprof.t_cap_loop;
             FZERO_LOG("INFO",
-                "  wide[copy=%s cov=%s hud=%s]: ProcessLine=%u = mask %u"
-                " + build %u + move %u | probe=%u (us/frame)",
+                "  wide[copy=%s cov=%s hud=%s tiles=%s render=%s comp=%s pass=%s scr=%s oam=%s]:"
+                " ProcessLine=%u = mask %u"
+                " + build %u + move %u + merge %u | probe=%u (us/frame)",
                 g_fzero_wide_sharedcopy ? "SHARED" : "full",
                 g_fzero_wide_fastcov ? "SLOTS" : "render",
                 g_fzero_wide_movehud ? "SPREAD" : "CENTRED",
+                g_fzero_wide_sidetiles ? "SIDE" : "patch",
+                g_fzero_wide_marginsonly ? "MARGINS" : "full",
+                g_fzero_wide_flatdirect ? "DIRECT" : "pair",
+                g_fzero_wide_nonative ? "ONE" : "two",
+                g_fzero_wide_framescratch ? "FRAME" : "line",
+                g_fzero_wide_keepoam ? "KEEP" : "wipe",
                 (unsigned int)((g_wideprof.t_mask + g_wideprof.t_build
-                                + g_wideprof.t_move) / n),
+                                + g_wideprof.t_move + g_wideprof.t_flatten) / n),
                 (unsigned int)(g_wideprof.t_mask / n),
                 (unsigned int)(g_wideprof.t_build / n),
                 (unsigned int)(g_wideprof.t_move / n),
+                (unsigned int)(g_wideprof.t_flatten / n),
                 (unsigned int)((g_timer_ns * (g_wideprof.n_reads / n)) / 1000u));
             FZERO_LOG("INFO",
                 "  wide-capture: total=%u (copy %u + runLine %u + loop %u)"
@@ -987,11 +1012,58 @@ static void HandleFrame(void) {
                 (unsigned int)(g_wideprof.n_move_bytes_kb / n));
             FZERO_LOG("INFO",
                 "  wide-build: ground %u lines %u us | ppu_runLine %u lines %u us"
-                " (us/frame)",
+                " | centre-skipped %u, native-skipped %u, full-copy %u lines"
+                " | limits=%s spared %lu lines/window (us/frame)",
                 (unsigned int)(g_wideprof.n_build_ground / n),
                 (unsigned int)(g_wideprof.t_build_ground / n),
                 (unsigned int)(g_wideprof.n_build_run / n),
-                (unsigned int)(g_wideprof.t_build_run / n));
+                (unsigned int)(g_wideprof.t_build_run / n),
+                (unsigned int)(g_wideprof.n_build_skip / n),
+                (unsigned int)(g_wideprof.n_native_skip / n),
+                (unsigned int)(g_wideprof.n_build_fresh / n),
+                g_ppu_margin_limits_hw ? "HW" : "old",
+                g_ppu_margin_spared);
+            g_ppu_margin_spared = 0;
+            /* The parts of draw= that no line above itemises. loop= is the host
+             * scanline loop measured per line; draw= minus it is the work
+             * around the loop. build pre and post are BuildWideLine around its
+             * render, centre is the 1 KB centre row copy. */
+            {
+                uint64_t loop = g_wideprof.t_loop_native + g_wideprof.t_loop_proc
+                              + g_wideprof.t_loop_hdma + g_wideprof.t_loop_irq;
+                FZERO_LOG("INFO",
+                    "  draw-loop: native %u + ProcessLine %u + hdma %u + irq %u"
+                    " = loop %u vs draw %u | build: pre %u post %u centre %u"
+                    " | wide reads %u (us/frame)",
+                    (unsigned int)(g_wideprof.t_loop_native / n),
+                    (unsigned int)(g_wideprof.t_loop_proc / n),
+                    (unsigned int)(g_wideprof.t_loop_hdma / n),
+                    (unsigned int)(g_wideprof.t_loop_irq / n),
+                    (unsigned int)(loop / n), (unsigned int)(g_acc_draw / n),
+                    (unsigned int)(g_wideprof.t_build_pre / n),
+                    (unsigned int)(g_wideprof.t_build_post / n),
+                    (unsigned int)(g_wideprof.t_build_centre / n),
+                    (unsigned int)(g_wideprof.n_reads / n));
+            }
+            /* The side array removes patch, and the margins-only render shrinks
+             * render, so the total alone cannot tell them apart. */
+            FZERO_LOG("INFO",
+                "  wide-ground: prep %u + render %u + patch %u"
+                " | probe=%u (us/frame)",
+                (unsigned int)(g_fzero_ground_prep / n),
+                (unsigned int)(g_fzero_ground_render / n),
+                (unsigned int)(g_fzero_ground_patch / n),
+                (unsigned int)((g_timer_ns * (g_fzero_ground_reads / n)) / 1000u));
+            g_fzero_ground_prep = g_fzero_ground_render = g_fzero_ground_patch = 0;
+            g_fzero_ground_reads = 0;
+            FZERO_LOG("INFO",
+                "  wide-ground memo: lookups %u room %u row %u panel %u (per frame)",
+                (unsigned int)(g_fzero_ground_lookups / n),
+                (unsigned int)(g_fzero_ground_room_reads / n),
+                (unsigned int)(g_fzero_ground_row_reads / n),
+                (unsigned int)(g_fzero_ground_panel_reads / n));
+            g_fzero_ground_lookups = g_fzero_ground_room_reads = 0;
+            g_fzero_ground_row_reads = g_fzero_ground_panel_reads = 0;
             memset(&g_wideprof, 0, sizeof(g_wideprof));
         }
 #endif
@@ -1000,30 +1072,20 @@ static void HandleFrame(void) {
     }
 }
 
-/*
- * Frame timing to maintain consistent frame rate
- */
 /* Drift-free frame pacing.
  *
- * The deadline advances by exactly one frame period; it is NOT resampled from
- * the clock after the sleep. Resampling was the bug: sceKernelDelayThreadCB
- * returns late by the scheduler's granularity, and taking the wake-up time as
- * the next frame's start folded that overshoot into the period permanently.
- * Measured: a 16,639 us target produced 16,835 us frames -- 59.4 Hz instead of
- * 60.0988, a 1.2%% shortfall that never recovered.
+ * The deadline advances by exactly one frame period; it is not resampled from
+ * the clock after the sleep. sceKernelDelayThreadCB returns late by the
+ * scheduler's granularity, and taking the wake-up time as the next frame's
+ * start adds that overshoot to every period (16,639 us became 16,835 us).
  *
- * That shortfall is an AUDIO bug more than a video one. The guest produces a
- * fixed 534 natives per emulated frame, so running the frame loop 1.2%% slow
- * under-produces audio by 1.2%%, and rtl_render_native's servo can only bend
- * consumption by +/-0.5%% (RTL_AUDIO_SERVO_MAX -- wider would be audible as
- * pitch drift). The deficit therefore cannot be absorbed: the DSP ring drains
- * to empty, starves, fades to silence, refills, and repeats. Measured at 0.5%%
- * of all output frames faded, in ~2 episodes per second, stable over 35,000
- * frames. The fix belongs here, where the missing time is, not in the servo.
+ * That is mainly an audio fault: the guest makes a fixed 534 natives per
+ * frame, so a slow loop under-produces audio, and rtl_render_native's servo
+ * can bend consumption by only +/-0.5%% (RTL_AUDIO_SERVO_MAX; more is audible
+ * as pitch drift). The DSP ring would drain, starve and fade to silence.
  *
- * Resync rather than chase if we fall more than two periods behind: after a
- * real hitch, sleeping out an accumulated debt would run the game fast to
- * "catch up", which is worse than dropping the debt. */
+ * Resync instead of catching up when more than two periods behind: after a
+ * real hitch, sleeping out the debt would run the game fast. */
 static void FrameTiming(void) {
     g_frame_start_time += g_frame_time_us;
     uint64_t now = sceKernelGetProcessTimeWide();
@@ -1033,76 +1095,64 @@ static void FrameTiming(void) {
         sceKernelDelayThreadCB((SceUInt)sleep_us);
     } else {
         g_acc_over++;   /* frame missed its budget: no headroom left here */
+        if (g_over_detail_n < FZ_OVER_CAP) {
+            g_over_detail[g_over_detail_n].idx = g_acc_frames;
+            g_over_detail[g_over_detail_n].cpu = g_frame_cpu_us;
+            g_over_detail[g_over_detail_n].draw = g_frame_draw_us;
+            g_over_detail[g_over_detail_n].aud = g_frame_aud_us;
+            g_over_detail[g_over_detail_n].upl = g_frame_upl_us;
+            g_over_detail[g_over_detail_n].cpy = g_frame_cpy_us;
+            ++g_over_detail_n;
+        }
         if (now - g_frame_start_time > 2 * g_frame_time_us)
             g_frame_start_time = now;
     }
 }
 
-/* ========================================================================
- * CLEANUP
- * ======================================================================== */
-
-/*
- * Clean up all resources
- */
 static void Cleanup(void) {
     FZERO_LOG("INFO", "Cleaning up...");
+
+    /* Stop the power callback thread first so it cannot race with the
+     * final RtlWriteSram below. g_running is already false at this point. */
+    StopPowerCallback();
 
     /* Join the APU worker before the audio thread, and both before anything
      * below frees emulator state: the worker cycles the SPC and the callback
      * reads the DSP ring, and g_spc_player owns the RAM under both. */
     apu_worker_stop();
 
-    /* Stop audio FIRST. SDL_CloseAudioDevice joins the audio thread, so after
-     * this nothing can be inside the callback. Everything below frees state
-     * the callback renders from -- g_spc_player owns the DSP's RAM -- so
-     * tearing those down first is a use-after-free on the audio thread. */
+    /* Stop audio first. SDL_DestroyAudioStream joins the audio thread, so
+     * after this nothing is inside the callback. Everything below frees state
+     * the callback renders from (g_spc_player owns the DSP's RAM). */
     audio_shutdown();
 
-    /* Write SRAM */
     if (g_snes_instance) {
-        RtlWriteSram();
+        SaveSram();
     }
 
-    /* Free ROM buffer */
     if (g_rom_buffer) {
         free(g_rom_buffer);
         g_rom_buffer = NULL;
     }
 
-    /* Free SPC player */
     if (g_spc_player) {
         free(g_spc_player);
         g_spc_player = NULL;
     }
 
-    /* Clean up input */
     input_shutdown();
 
-    /* Clean up SDL */
-    if (g_texture) {
-        SDL_DestroyTexture(g_texture);
-        g_texture = NULL;
-    }
-    if (g_renderer) {
-        SDL_DestroyRenderer(g_renderer);
-        g_renderer = NULL;
-    }
+    GxmPresentShutdown();
     if (g_window) {
         SDL_DestroyWindow(g_window);
         g_window = NULL;
     }
     SDL_Quit();
 
-    /* Shutdown platform */
     platform_shutdown();
 
     FZERO_LOG("INFO", "Cleanup complete");
 }
-
-/* ========================================================================
- * MAIN ENTRY POINT
- * ======================================================================== */
 
 static void handle_sigabrt(int sig) {
     (void)sig;
@@ -1116,31 +1166,38 @@ int main(int argc, char **argv) {
 
     signal(SIGABRT, handle_sigabrt);
     freopen("ux0:/data/fzero_recomp/stderr.txt", "w", stderr);
+    /* The runner reports SRAM write failures with fprintf(stderr, ...). A
+     * freopen'd file stream is block-buffered, so on a hard kill (power off,
+     * crash) those messages never reach the file. Unbuffer stderr so a failed
+     * RtlWriteSram is visible in stderr.txt. */
+    setvbuf(stderr, NULL, _IONBF, 0);
     freopen("ux0:/data/fzero_recomp/stdout.txt", "w", stdout);
 
     FZERO_LOG("INFO", "F-Zero Recomp - PS Vita starting (Heap: %u MB)", _newlib_heap_size_user / (1024 * 1024));
 
-    /* Initialize all subsystems */
     if (!InitAll()) {
         FZERO_LOG("ERROR", "Initialization failed!");
         Cleanup();
         return 1;
     }
 
-    /* Load ROM and initialize SNES */
     if (!LoadAndInitSNES()) {
         FZERO_LOG("ERROR", "ROM loading or SNES initialization failed!");
         Cleanup();
         return 1;
     }
 
-    /* Safe to start the audio thread now: it renders from g_snes. The APU
-     * worker dereferences the same state, so it starts here too and not a
-     * line earlier. */
+    /* The audio thread and the APU worker render from g_snes, so they start
+     * only now. */
     apu_worker_start();
+#if FZERO_COREBENCH
+    /* After apu_worker_start, which pins the game thread to core 0. The APU
+     * worker is idle here (the game loop has not started, so
+     * rtl_apu_worker_active is false), so this runs before audio_start. */
+    CoreBench();
+#endif
     audio_start();
 
-    /* Main game loop */
     FZERO_LOG("INFO", "Entering main game loop");
     
     g_frame_start_time = sceKernelGetProcessTimeWide();
@@ -1150,7 +1207,6 @@ int main(int argc, char **argv) {
         FrameTiming();
     }
 
-    /* Clean up and exit */
     Cleanup();
     FZERO_LOG("INFO", "F-Zero Recomp exited cleanly");
 

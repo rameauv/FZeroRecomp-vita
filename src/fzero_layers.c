@@ -3,22 +3,10 @@
 #include <string.h>
 #include <stdlib.h>
 
-
-/* ---------------------------------------------------------------------------
- * FZERO_WIDEPROF -- probes INSIDE the layers pass.
- *
- * Timed only from the outside, most of widescreen's Vita cost shows up as
- * "everything else". These probes open it: the three parts of FZeroLayersProcessLine, and inside each the scratch
- * copy, the extra ppu_runLine and the per-pixel loops -- plus the BYTES each
- * copy moves, because the startup membench shows bytes are what port to this
- * machine and microseconds are what do not.
- *
- * Measured on PC first: ProcessLine 9,070 us/frame = mask 3,185 + build 1,425
- * + move 4,470, of which CaptureSprites alone is 6,390 (70%) and its
- * whole-Ppu memcpy is 4,280. The pass copies 153 MB/frame and 149 MB of that
- * is CaptureSprites and MoveWideHud -- two sites CopyPpuForWideLine
- * never reached, while the one it did reach now moves 3.8 MB.
- * --------------------------------------------------------------------------- */
+/* FZERO_WIDEPROF: probes inside the layers pass. The three parts of
+ * FZeroLayersProcessLine, and inside each the scratch copy, the extra
+ * ppu_runLine and the per-pixel loops, plus the bytes each copy moves (on this
+ * machine, bytes moved predict the cost better than time on another). */
 #if FZERO_WIDEPROF
 #include <psp2/kernel/processmgr.h>
 struct FZeroWideProf g_wideprof;
@@ -34,33 +22,169 @@ struct FZeroWideProf g_wideprof;
 
 /* The shared scratch copy applied to CaptureSprites and MoveWideHud as well.
  * 1 = use CopyPpuForWideLine everywhere (~18 KB per copy), 0 = the original
- * whole-struct memcpy (198,432 B). Runtime so FZERO_WIDE_SHAREDCOPY_AB can
- * alternate it inside one run; a Vita launch has no environment, so the arm
- * must come from the build. Defaults ON. */
+ * whole-struct memcpy (198,432 B). */
 int g_fzero_wide_sharedcopy = 1;
 
 /* Collapse the 704 coverage renders. 1 = read the winning OAM
  * slot the native sprite pass already recorded, 0 = re-render the line once per
- * OAM range. Runtime so FZERO_WIDE_FASTCOV_AB can alternate it inside one run;
- * a Vita launch has no environment, so the arm must come from the build. */
+ * OAM range. */
 int g_fzero_wide_fastcov = 1;
 
 /* Spread the HUD to the screen edges, or leave it centred. 1 = MoveWideHud
  * runs: right-half HUD shifts +142px and the scene beneath it is re-rendered
  * to fill the hole. 0 = the HUD stays in the original centred 256 band and the
- * world simply extends past it, which costs nothing because the pass is
- * skipped entirely.
+ * world extends past it, and the pass is skipped.
  *
- * DEFAULT 0 -- a deliberate concession, taken because MoveWideHud is 38% of
- * the pass on PC and buys placement rather than content. FZERO_WIDE_MOVEHUD_AB
- * alternates the arms to re-price it. Unlike every other lever here this one
- * CHANGES THE PICTURE, so WIDECRC differing between arms is expected. */
+ * Default 0: MoveWideHud is expensive and changes only where the HUD is.
+ * Unlike the other levers here, this one changes the picture, so WIDECRC
+ * differs between the two values. */
 int g_fzero_wide_movehud = 0;
+
+/* The ground's corrected tiles as a side array rather than journalled patches
+ * into the live tilemap. See fzero_ground.h. Both values give the same
+ * picture (WIDECRC and FBCRC identical). */
+int g_fzero_wide_sidetiles = 1;
+
+/* Render the margins only. Every scanline is rasterised twice: 256 px kept as
+ * the authentic output, then 398 px whose centre 256 are discarded and
+ * overwritten. 1 = mark the centre span as already drawn so the drawers, the
+ * backdrop clear and the compose loop all skip it; 0 = full-width wide render.
+ *
+ * Both values must give the same picture: a WIDECRC difference means the skip
+ * reached something that is read. */
+int g_fzero_wide_marginsonly = 1;
+
+/* Write the composited frame directly, instead of building a world/hud pair
+ * and merging it back together.
+ *
+ * The desktop host keeps the two layers apart so FZeroVisualStyle can shade
+ * the scene without touching the HUD. The Vita presents one flat image, so the
+ * split carries no information: the merged centre is the native framebuffer,
+ * and every merged margin pixel equals wide_capture. The mask phase splits
+ * each row into two complementary images, and the merge recombines them into
+ * the row it started from, which is an expensive memcpy.
+ *
+ * 1 = write layers->flat directly and skip all of it; 0 = the pair route,
+ * which still fills layers->flat at the end. The two must be byte-identical.
+ *
+ * It steps aside when MoveWideHud is live. That pass writes the pair directly
+ * and relies on the split (its last loop writes hud without clearing world, and
+ * that is where the layers stop being complementary), so the direct route
+ * cannot reproduce it. */
+int g_fzero_wide_flatdirect = 1;
+
+/* Do not run the native 256-wide render on lines the wide pass covers, and
+ * take the centre from the wide render.
+ *
+ * This is not an equivalence in general, because the wide pass feeds the
+ * rasteriser different inputs:
+ * ExtendPanorama rewrites BG tilemap entries, FZeroVehiclesApply and
+ * ExtendVehicleSprites add reconstructed vehicles which can evict real sprites
+ * through the 32-per-line and 34-tile limits, kPpuRenderFlags_NoSpriteLimits
+ * removes the authentic flicker those limits cause, and the layer clamp
+ * differs. With the additive sprite list and the hardware limits kept, the
+ * centre is byte-identical to the native render.
+ *
+ * Both arrangements rasterise 398 columns a line (native 256 plus margins
+ * 142, or wide 398), so only the per-line fixed cost changes: one
+ * ppu_evaluateSprites instead of two (it walks all 128 OAM entries regardless
+ * of width), one set of window calculations, one backdrop setup.
+ *
+ * To check the centre, compare SNESRECOMP_CENTRECRC with the FBCRC of a run
+ * with SNESRECOMP_PRESENTATION=legacy, which never loads the wide pass.
+ *
+ * Two hard requirements, enforced in FZeroLayersWantsNativeLine:
+ *   - the direct composite must be on. The pair route's mask phase reads
+ *     ppu->objBuffer and ppu->bgBuffers[0], which only the native render
+ *     fills; without it they are the previous line's, silently.
+ *   - the line must be one the wide pass actually renders. On an unsupported
+ *     line BuildWideLine draws nothing, and with no native render either the
+ *     centre would simply be blank. */
+#ifndef FZERO_WIDE_NONATIVE_DEFAULT
+#define FZERO_WIDE_NONATIVE_DEFAULT 0
+#endif
+int g_fzero_wide_nonative = FZERO_WIDE_NONATIVE_DEFAULT;
+
+/* The picture half of the option above, without its saving. 1 = take the
+ * centre from the wide render; 0 = from the native framebuffer. Implied by
+ * g_fzero_wide_nonative. On its own, the native render still runs, so
+ * g_pixels stays a reference for how much the centre changed. */
+int g_fzero_wide_widecentre = 0;
+
+/* Keep the game's sprite list in the wide render and add the reconstructed
+ * cars to it, instead of wiping it. Every extension this pass makes must be
+ * side-local; wiping OAM is not, because it removes the HUD from the centre
+ * and cuts the game's own sprites at the native edge. See FZeroVehiclesApply.
+ *
+ * Test this with a race (SNESRECOMP_INPUT_SCRIPT), not the attract demo: the
+ * demo shows only the player car and never reconstructs one. */
+#ifndef FZERO_WIDE_KEEPOAM_DEFAULT
+#define FZERO_WIDE_KEEPOAM_DEFAULT 1
+#endif
+int g_fzero_wide_keepoam = FZERO_WIDE_KEEPOAM_DEFAULT;
+
+/* kPpuRenderFlags_NoSpriteLimits lets the reconstructed side pieces bypass
+ * the sprite budget, but it lifts the limits across the whole scanline,
+ * centre included. Default 0: obey the hardware limits. At a race start the
+ * field is bunched, lines exceed 32 sprites, and without the limits the wide
+ * render draws sprites the hardware drops, so the centre differs from the
+ * native one. */
+int g_fzero_wide_nolimits = 0;
+
+/* Keep the wide render's scratch Ppu for a whole frame instead of re-copying
+ * it every line. See FRAME SCRATCH in BuildWideLine. Byte-identical to the
+ * per-line copy. */
+int g_fzero_wide_framescratch = 1;
 
 /* Defined below, beside the reasoning about what may be skipped. */
 static size_t CopyPpuForWideLine(FZeroLayers *layers, Ppu *copy, const Ppu *ppu);
 
+/* Whether the direct route may be taken for this frame's configuration. */
+static bool FlatDirect(const FZeroLayers *layers) {
+    return g_fzero_wide_flatdirect &&
+           !(layers->move_hud && g_fzero_wide_movehud);
+}
+
+/* The one place the `supported` test lives, so the host's decision to skip the
+ * native render (before ppu_runLine) and BuildWideLine's decision to render
+ * (inside ProcessLine) cannot disagree. A disagreement would be a blank
+ * centre. */
+static bool LineSupported(const Ppu *ppu, bool racing) {
+    return racing && (PPU_mode(ppu) == 1 || PPU_mode(ppu) == 7) &&
+        !PPU_forcedBlank(ppu) && !ppu->extraLeftRight && !PPU_objInterlace(ppu) &&
+        (ppu->renderFlags & kPpuRenderFlags_NewRenderer);
+}
+
+bool FZeroLayersWantsNativeLine(const FZeroLayers *layers, const Ppu *ppu,
+                                int line, bool racing) {
+    if (!g_fzero_wide_nonative) return true;
+    if (line < 1 || line > FZERO_LAYER_HEIGHT) return true;
+    /* See g_fzero_wide_nonative. Without these, the mask is stale and the
+     * centre is blank. */
+    if (!FlatDirect(layers)) return true;
+    /* Without the additive sprite list the wide render has no HUD for the
+     * centre. */
+    if (!g_fzero_wide_keepoam) return true;
+    if (LineSupported(ppu, racing)) {
+#if FZERO_WIDEPROF
+        ++g_wideprof.n_native_skip;
+#endif
+        return false;
+    }
+    return true;
+}
+
+/* The pair route's merge into layers->flat, so both routes produce the same
+ * output. Per line, so it reads data still in cache. */
+static void FlattenLine(FZeroLayers *layers, int y) {
+    const uint32_t *w = layers->wide_world[y], *h = layers->wide_hud[y];
+    uint32_t *flat = layers->flat[y];
+    for (int x = 0; x < FZERO_WIDE_WIDTH; ++x)
+        flat[x] = (h[x] & 0xff000000u) ? (h[x] & 0x00ffffffu) : w[x];
+}
+
 static size_t CopyScratch(FZeroLayers *layers, Ppu *copy, const Ppu *ppu) {
+    layers->frame_scratch_valid = false;   /* see FRAME SCRATCH */
     if (g_fzero_wide_sharedcopy) return CopyPpuForWideLine(layers, copy, ppu);
     memcpy(copy, ppu, sizeof(*copy));
     copy->renderVram = NULL;   /* this arm owns its own VRAM copy */
@@ -84,7 +208,7 @@ static bool RangeOnLine(const Ppu *ppu, int y, int first, int count) {
  * it in ppu->objSlotOf. The re-render only ever set the mask where the range
  * winner WAS the global winner (selected == bgBuffers[0]), so the global slot
  * carries everything the range query can extract and "did a slot in [first,
- * first+count) cover this pixel" is a comparison rather than a scanline.
+ * first+count) cover this pixel" is a comparison, not a render.
  *
  * Safe on the one flag that would break it: every call site passes flags = 0,
  * so kPpuOverlayFlag_RemoveFromGame never fires and the global winner is never
@@ -222,6 +346,9 @@ static void ExtendVehicleSprites(Ppu *copy) {
         bool unused = slot < 116 && (copy->oam[index] >> 8) == 0;
         if (vehicle && !parked && !unused) {
             hints[slot >> 3] |= 1u << (slot & 7);
+        } else if (g_fzero_wide_keepoam) {
+            /* Leave it where the game put it. Without a hint it still cannot
+             * decode into the right margin; it simply stays in the centre. */
         } else {
             /* With no right hint, x=256 decodes to -256. Unlike hiding by Y,
              * this cannot wrap back onto the top scanlines. */
@@ -233,7 +360,8 @@ static void ExtendVehicleSprites(Ppu *copy) {
     PpuWsSetOamRightHints(copy, hints);
     /* Extra side pieces must not consume the authentic sprite budget.
      * Only this disposable side pass bypasses the hardware limits. */
-    copy->renderFlags |= kPpuRenderFlags_NoSpriteLimits;
+    if (g_fzero_wide_nolimits)
+        copy->renderFlags |= kPpuRenderFlags_NoSpriteLimits;
 }
 
 /* Intro and result layouts use sprites and BG3 for lettering and counters.
@@ -278,15 +406,14 @@ bool FZeroWideVramRestore(Ppu *copy) {
     return !g_wv_overflow;
 }
 
-/* The per-line scratch copy. See FZERO_WIDE_FASTCOPY. */
+/* The per-line scratch copy. */
 static int g_wide_fastcopy = -1;
 static int g_wide_vramshare = -1;
 /* wsMode2Capture and wsMode2Bg1Palette are two FRAME-sized (224 x 256) buffers
- * inside Ppu -- together 114,688 bytes, 58% of the struct. The rasteriser only
- * ever WRITES them, and memsets each row before filling it, so nothing this
- * copy brings in is ever read back. They also belong to a Mode 2 capture
- * feature that F-Zero never enables (wsMode2CaptureLayer stays 0). Copying
- * them per scanline moves 25.7 MB/frame of untouched zeroes.
+ * inside Ppu, together 114,688 bytes, 58% of the struct. The rasteriser only
+ * writes them, and memsets each row before filling it, so nothing this copy
+ * brings in is read. They belong to a Mode 2 capture feature that F-Zero never
+ * enables (wsMode2CaptureLayer stays 0).
  *
  * Skipped only when the feature is off; if a title ever enables it, fall back
  * to the whole-struct copy rather than reason about what it reads. */
@@ -312,14 +439,13 @@ static size_t CopyPpuForWideLine(FZeroLayers *layers, Ppu *copy, const Ppu *ppu)
            kTo   = offsetof(Ppu, wsMode2Bg1Palette) +
                    sizeof(((Ppu *)0)->wsMode2Bg1Palette),
            kVram = offsetof(Ppu, vram) };
-    /* THREE ranges, not two. bgBuffers, objBuffer, objSlotOf and overlayBuffers
-     * are contiguous -- 13,600 B, 72% of what this copy used to move -- and are
-     * per-line WORKING buffers: ppu_runLine clears each one before it reads it,
-     * so nothing the copy brought across was ever observed. Proven rather than
-     * argued: poisoning the range with 0xAA instead of copying it left WIDECRC
-     * byte-identical over 1,707 distinct wide images.
+    /* Three ranges. bgBuffers, objBuffer, objSlotOf and overlayBuffers are
+     * contiguous (13,600 B) and are per-line working buffers: ppu_runLine
+     * clears each one before it reads it, so a copy of them is never read.
+     * (Filling the range with 0xAA instead of copying it leaves WIDECRC
+     * unchanged.)
      *
-     * The asserts are load-bearing in the same way the wsMode2 pair is. A field
+     * The asserts protect this the same way as for the wsMode2 pair. A field
      * inserted anywhere inside this block would be silently skipped, and a
      * field that is real state rather than a working buffer would then read as
      * whatever the previous line left behind. */
@@ -354,23 +480,73 @@ static size_t CopyPpuForWideLine(FZeroLayers *layers, Ppu *copy, const Ppu *ppu)
      * the live array, journalled, and FZeroWideVramRestore puts it back before
      * the line ends. Nothing observes VRAM in between: the guest is not running
      * inside the per-line hook, and the APU worker and audio thread never touch
-     * it. vramVersion is deliberately NOT bumped -- the array is byte-identical
-     * again by the time anyone can look, which is the same invariant the copy
-     * used to provide by brute force. */
+     * it. vramVersion is not incremented: the array is byte-identical again
+     * before anything can read it. */
     copy->renderVram = ppu->vram;
     return moved;
 }
 static void BuildWideLine(FZeroLayers *layers, const Ppu *ppu, int line,
                           bool supported, bool hud_layout) {
     int y = line - 1;
+    const bool direct = FlatDirect(layers);
+    /* True exactly when the host skipped ppu_runLine for this line, which is
+     * the same condition inverted -- shared so the two cannot disagree. */
+    const bool nonative = supported && direct && g_fzero_wide_nonative &&
+                          g_fzero_wide_keepoam;
+    /* The centre comes from the wide render when asked for it, and always when
+     * there is no native render to take it from. */
+    const bool widecentre = nonative ||
+                            (supported && direct && g_fzero_wide_widecentre);
     uint32_t *world = layers->wide_world[y], *hud = layers->wide_hud[y];
-    memset(world, 0, sizeof(layers->wide_world[y]));
-    for (int x = 0; x < FZERO_WIDE_WIDTH; ++x) hud[x] = 0xff000000;
+    if (!direct) {
+        memset(world, 0, sizeof(layers->wide_world[y]));
+        for (int x = 0; x < FZERO_WIDE_WIDTH; ++x) hud[x] = 0xff000000;
+    } else if (!supported) {
+        /* The pair route produced world=0 / hud=opaque black here, which
+         * merges to black. Only the margins need it: the centre is overwritten
+         * from the native framebuffer below either way. */
+        uint32_t *flat = layers->flat[y];
+        for (int x = 0; x < FZERO_WIDE_MARGIN; ++x) flat[x] = 0;
+        for (int x = FZERO_WIDE_MARGIN + FZERO_NATIVE_WIDTH;
+             x < FZERO_WIDE_WIDTH; ++x) flat[x] = 0;
+    }
     if (supported) {
         Ppu *copy = &layers->scratch;
+        /* FRAME SCRATCH. Between two lines of one frame the guest changes
+         * only the register block, and the setup below gives the same result
+         * on every line except the layer clamp. So keep the
+         * scratch for the whole frame: copy all of it on the frame's first
+         * line, and only the registers after that. The render's own tables
+         * (cgramLut, brightnessMult) are then built once a frame instead of
+         * once a line. A guest write into OAM or CGRAM, a policy change, or
+         * another user of the scratch forces the full copy again. */
+        const uint8_t fs_key = (uint8_t)(1u | layers->native_oam << 1 |
+                                         layers->vehicles.ready << 2 |
+                                         (g_fzero_wide_nolimits != 0) << 3);
+        const bool fs_keep = g_fzero_wide_framescratch &&
+                             layers->frame_scratch_valid &&
+                             line > layers->frame_scratch_line &&
+                             ppu->oamCgramVersion == layers->frame_scratch_memver &&
+                             fs_key == layers->frame_scratch_key &&
+                             (!layers->frame_scratch_ownvram ||
+                              ppu->vramVersion == layers->frame_scratch_vramver);
+        _Static_assert(offsetof(Ppu, extraLeftCur) >=
+                       offsetof(Ppu, countersLatched) + sizeof(((Ppu *)0)->countersLatched),
+                       "the register block must end before extraLeftCur");
+        _Static_assert(offsetof(Ppu, inidisp) == 0, "the register block starts the struct");
         WP_T0(wp_a);
-        size_t wp_moved = CopyPpuForWideLine(layers, copy, ppu);
+        size_t wp_moved;
+        if (fs_keep) {
+            memcpy(copy, ppu, offsetof(Ppu, extraLeftCur));
+            /* FZeroVehiclesApply's wiped path zeroes these two registers. */
+            copy->oamaddl = layers->frame_scratch_oamaddl;
+            copy->oamaddh = layers->frame_scratch_oamaddh;
+            wp_moved = offsetof(Ppu, extraLeftCur);
+        } else {
+            wp_moved = CopyPpuForWideLine(layers, copy, ppu);
+        }
         WP_ADD(t_build_copy, wp_a);
+        WP_T0(wp_pre);
 #if FZERO_WIDEPROF
         ++g_wideprof.n_build_ran;
         g_wideprof.n_build_bytes_kb += (uint32_t)(wp_moved / 1024);
@@ -378,28 +554,77 @@ static void BuildWideLine(FZeroLayers *layers, const Ppu *ppu, int line,
         (void)wp_moved;
 #endif
         FZeroWideVramBegin();
-        copy->renderBuffer = (uint8_t *)layers->wide_capture;
-        copy->renderPitch = sizeof(layers->wide_capture[0]);
-        PpuClearOverlayBindings(copy);
-        PpuSetExtraSpace(copy, FZERO_WIDE_MARGIN);
+        if (!fs_keep) {
+            copy->renderBuffer = (uint8_t *)layers->wide_capture;
+            copy->renderPitch = sizeof(layers->wide_capture[0]);
+            PpuClearOverlayBindings(copy);
+            PpuSetExtraSpace(copy, FZERO_WIDE_MARGIN);
+            /* Artwork. FZeroVehiclesApply writes a reconstructed car's pose
+             * into copy->vram, but a scratch that shares the live VRAM
+             * renders from renderVram, so the car would be drawn with
+             * whatever the live VRAM holds at that address. On a frame that
+             * adds a car, give the scratch its own
+             * copy of VRAM (64 KB once a frame) so the artwork is what is
+             * drawn. The ground's and panorama's journalled patches follow,
+             * because the journal writes to FZeroWideVram(copy). */
+            bool own_vram = false;
+            if (!layers->native_oam && layers->vehicles.ready)
+                for (unsigned id = 0; id < 6; ++id)
+                    own_vram |= layers->vehicles.car[id].added;
+            if (own_vram) {
+                memcpy(copy->vram, ppu->vram, sizeof(copy->vram));
+                copy->renderVram = NULL;
+            }
+            layers->frame_scratch_ownvram = own_vram;
+            layers->frame_scratch_vramver = ppu->vramVersion;
+            if (layers->native_oam) {
+                /* Full-screen effects use the native list, not racing vehicle
+                 * groups. Preserve its signed coordinates and current artwork. */
+                uint8_t hints[16] = {0};
+                PpuWsSetOamLeftHints(copy, hints);
+                PpuWsSetOamRightHints(copy, hints);
+                if (g_fzero_wide_nolimits)
+                    copy->renderFlags |= kPpuRenderFlags_NoSpriteLimits;
+            } else if (layers->vehicles.ready) FZeroVehiclesApply(&layers->vehicles, copy);
+            else ExtendVehicleSprites(copy);
+            layers->frame_scratch_valid = true;
+            layers->frame_scratch_memver = ppu->oamCgramVersion;
+            layers->frame_scratch_key = fs_key;
+            layers->frame_scratch_oamaddl = copy->oamaddl;
+            layers->frame_scratch_oamaddh = copy->oamaddh;
+        }
+        layers->frame_scratch_line = line;
+#if FZERO_WIDEPROF
+        g_wideprof.n_build_fresh += !fs_keep;
+#endif
+        /* Per line: the clamp band, and the panorama's journalled VRAM
+         * patches, which FZeroWideVramRestore undoes at the end of the line. */
         PpuSetWidescreenLayerClamp(copy, y < 48 ? 4 : 0);
         if (PPU_mode(ppu) == 1) {
             ExtendPanorama(copy, ppu, line, 0, layers->intro_panorama);
             ExtendPanorama(copy, ppu, line, 1, layers->intro_panorama);
         }
-        if (layers->native_oam) {
-            /* Full-screen effects use the native list, not racing vehicle
-             * groups. Preserve its signed coordinates and current artwork. */
-            uint8_t hints[16] = {0};
-            PpuWsSetOamLeftHints(copy, hints);
-            PpuWsSetOamRightHints(copy, hints);
-            copy->renderFlags |= kPpuRenderFlags_NoSpriteLimits;
-        } else if (layers->vehicles.ready) FZeroVehiclesApply(&layers->vehicles, copy);
-        else ExtendVehicleSprites(copy);
-        /* Two renderers, not one. FZeroGroundRenderLine is the Mode 7 margin
-         * path and takes most race lines; ppu_runLine is the general fallback.
-         * Timing them together would attribute all of this to
-         * "BuildWideLine's own wide ppu_runLine". */
+        /* Two renderers: FZeroGroundRenderLine is the Mode 7 margin path and
+         * takes most race lines; ppu_runLine is the general fallback. They
+         * are timed separately. */
+        /* Margins only. The consume loop below reads only x outside the
+         * authentic centre, and the centre of this framebuffer is memcpy'd
+         * over from the native render immediately afterwards, so the centre
+         * of this render is discarded in full. Ask the rasteriser not to
+         * produce it -- but only on lines where the PPU says the margins come
+         * out unchanged, which is what PpuWidescreenCentreSkipSafe decides. */
+        {
+            /* The margins-only skip and the no-native experiment want opposite
+             * things from the same render: one discards the centre, the other
+             * keeps it as the only copy there is. No-native wins. */
+            bool wp_skip = g_fzero_wide_marginsonly && !widecentre &&
+                           PpuWidescreenCentreSkipSafe(copy, y);
+            PpuSetWidescreenCentreSkip(copy, wp_skip);
+#if FZERO_WIDEPROF
+            g_wideprof.n_build_skip += wp_skip;
+#endif
+        }
+        WP_ADD(t_build_pre, wp_pre);
         { WP_T0(wp_r);
           if (FZeroGroundRenderLine(&layers->ground, copy, line)) {
               WP_ADD(t_build_ground, wp_r);
@@ -413,6 +638,20 @@ static void BuildWideLine(FZeroLayers *layers, const Ppu *ppu, int line,
               ++g_wideprof.n_build_run;
 #endif
           } }
+        WP_T0(wp_post);
+        PpuSetWidescreenCentreSkip(copy, false);
+        if (direct) {
+            /* Both branches of the pair route merge to the same value, so a
+             * flat host's margin is just the rendered pixel. Two tight runs
+             * over 71 columns each, instead of 398 iterations skipping 256. */
+            uint32_t *flat = layers->flat[y];
+            const uint32_t *cap = layers->wide_capture[y];
+            for (int x = 0; x < FZERO_WIDE_MARGIN; ++x)
+                flat[x] = cap[x] & 0x00ffffffu;
+            for (int x = FZERO_WIDE_MARGIN + FZERO_NATIVE_WIDTH;
+                 x < FZERO_WIDE_WIDTH; ++x)
+                flat[x] = cap[x] & 0x00ffffffu;
+        } else
         for (int x = 0; x < FZERO_WIDE_WIDTH; ++x) {
             if (x >= FZERO_WIDE_MARGIN && x < FZERO_WIDE_MARGIN + FZERO_NATIVE_WIDTH) continue;
             /* A full-centre fallback must also protect the sides. Otherwise
@@ -427,10 +666,32 @@ static void BuildWideLine(FZeroLayers *layers, const Ppu *ppu, int line,
         }
         ++layers->wide_lines;
         /* Undo this line's VRAM patches so the scratch is again equal to the
-         * live VRAM -- the invariant the whole-struct copy used to provide.
-         * An overflowed journal cannot be unwound, so force a full re-copy. */
-        if (!FZeroWideVramRestore(copy))
+         * live VRAM. An overflowed journal cannot be unwound, so force a full re-copy. */
+        if (!FZeroWideVramRestore(copy)) {
             layers->scratch_vram_valid = false;
+            layers->frame_scratch_valid = false;
+        }
+        WP_ADD(t_build_post, wp_post);
+    }
+    if (direct) {
+        if (widecentre) {
+            /* There is no native framebuffer row for this line -- the host did
+             * not render one. The wide render's own centre is the only copy. */
+            WP_T0(wp_c);
+            memcpy(layers->flat[y] + FZERO_WIDE_MARGIN,
+                   &layers->wide_capture[y][FZERO_WIDE_MARGIN],
+                   FZERO_NATIVE_WIDTH * sizeof(uint32_t));
+            WP_ADD(t_build_centre, wp_c);
+            return;
+        }
+        /* The merged centre is the native framebuffer row. The pair route
+         * reaches it by splitting that row on mask[] and joining it again. */
+        WP_T0(wp_c);
+        memcpy(layers->flat[y] + FZERO_WIDE_MARGIN,
+               ppu->renderBuffer + y * ppu->renderPitch,
+               FZERO_NATIVE_WIDTH * sizeof(uint32_t));
+        WP_ADD(t_build_centre, wp_c);
+        return;
     }
     memcpy(world + FZERO_WIDE_MARGIN, layers->world[y], sizeof(layers->world[y]));
     memcpy(hud + FZERO_WIDE_MARGIN, layers->hud[y], sizeof(layers->hud[y]));
@@ -564,12 +825,18 @@ void FZeroLayersProcessLine(FZeroLayers *layers, const Ppu *ppu, int line,
 #endif
     int y = line - 1;
     const uint32_t *original = (const uint32_t *)(ppu->renderBuffer + y * ppu->renderPitch);
-    bool supported = racing && (PPU_mode(ppu) == 1 || PPU_mode(ppu) == 7) &&
-        !PPU_forcedBlank(ppu) && !ppu->extraLeftRight && !PPU_objInterlace(ppu) &&
-        (ppu->renderFlags & kPpuRenderFlags_NewRenderer);
+    bool supported = LineSupported(ppu, racing);
     bool mask[FZERO_LAYER_WIDTH] = {0};
     bool text_layout = layers->intro_panorama || layers->results_layout;
-    if (supported && text_layout) {
+    /* The whole of this phase exists to split `original` into two complementary
+     * images on mask[], and the only reader of that pair merges it back into
+     * `original`. On the direct route nothing splits, so none of it runs --
+     * sprite coverage included. See FlatDirect and g_fzero_wide_flatdirect. */
+    const bool direct = FlatDirect(layers);
+    unsigned pixels = 0;
+    if (direct) {
+        (void)mask;
+    } else if (supported && text_layout) {
         /* Keep the selected filter through intro and results. The GP ending
          * retains racing vehicles; protect its text slots but not those cars.
          * Only the GP ending retains the racing power-window mask. */
@@ -597,12 +864,12 @@ void FZeroLayersProcessLine(FZeroLayers *layers, const Ppu *ppu, int line,
         memset(mask, 1, sizeof(mask));
         ++layers->protected_lines;
     }
-    unsigned pixels = 0;
-    for (int x = 0; x < FZERO_LAYER_WIDTH; ++x) {
-        layers->hud[y][x] = mask[x] ? original[x] | 0xff000000u : 0;
-        layers->world[y][x] = mask[x] ? 0 : original[x];
-        pixels += mask[x];
-    }
+    if (!direct)
+        for (int x = 0; x < FZERO_LAYER_WIDTH; ++x) {
+            layers->hud[y][x] = mask[x] ? original[x] | 0xff000000u : 0;
+            layers->world[y][x] = mask[x] ? 0 : original[x];
+            pixels += mask[x];
+        }
 #if FZERO_WIDEPROF
     g_wideprof.t_capsub_mask += WP_CAP_TOTAL() - wp_cap0;
 #endif
@@ -622,6 +889,9 @@ void FZeroLayersProcessLine(FZeroLayers *layers, const Ppu *ppu, int line,
     g_wideprof.t_capsub_move += WP_CAP_TOTAL() - wp_cap1;
 #endif
     WP_ADD(t_move, wp_move);
+    /* The pair route's merge, per line while the 398 pixels are still in
+     * cache. The direct route has already written layers->flat. */
+    if (!direct) { WP_T0(wp_fl); FlattenLine(layers, y); WP_ADD(t_flatten, wp_fl); }
     if (supported && (hud_layout || text_layout) && pixels) ++layers->extracted_lines;
     layers->hud_pixels += pixels;
 }

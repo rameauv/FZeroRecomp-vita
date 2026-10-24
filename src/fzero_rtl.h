@@ -8,6 +8,13 @@
 void FZeroRunOneFrameOfGame(void);
 void FZeroDrawPpuFrame(void);
 
+/* Re-arm the frame driver's boot gate after the host soft-resets the machine
+ * (RtlReset). The next FZeroRunOneFrameOfGame then re-runs the reset-vector
+ * boot (cpu_state_init + scheduler from $8000) instead of resuming the
+ * main-loop spin with a stale CPU over a zeroed machine. Call after
+ * RtlReset, before the next frame. */
+void FZeroSoftReset(void);
+
 struct FZeroLayers;
 void FZeroSetLayers(struct FZeroLayers *layers);
 

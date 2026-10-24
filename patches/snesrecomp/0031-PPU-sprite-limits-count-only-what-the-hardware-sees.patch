@@ -1,0 +1,137 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Thu, 24 Sep 2026 21:40:30 +0900
+Subject: [PATCH 31/33] PPU: sprite limits count only what the hardware sees
+
+A sprite or sliver that lies only in a widescreen margin is off-screen on
+the console, so it neither spends the 32-sprite and 34-sliver budget nor is
+dropped by it. Without margins every counted sprite intersects 0..255, so
+the native render is unchanged. g_ppu_margin_limits_hw selects the rule,
+g_ppu_margin_spared counts the lines it drew in full.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 65 ++++++++++++++++++++++++++++++++++---------
+ runner/src/snes/ppu.h |  2 ++
+ 2 files changed, 54 insertions(+), 13 deletions(-)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 69b7be3..af4ab81 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -109,6 +109,14 @@ void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+ 
+ static void PpuDrawWholeLine(Ppu *ppu, uint y);
+ 
++/* 1 = the sprite limits count only sprites and slivers that intersect x 0..255,
++ * as the hardware does, so widescreen margins neither spend nor lose budget.
++ * 0 = the old rule, which counted margin pieces too and dropped car pieces in
++ * busy margins. g_ppu_margin_spared counts the scanlines the old rule would
++ * have cut and this one drew in full. */
++int g_ppu_margin_limits_hw = 1;
++unsigned long g_ppu_margin_spared;
++
+ static bool ppu_evaluateSprites(Ppu* ppu, int line);
+ static uint16_t ppu_getVramRemap(Ppu* ppu);
+ static void PpuUpdateWidescreenOamHistory(Ppu *ppu, int line);
+@@ -2761,6 +2769,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+   int spritesFound = 0;
+   int tilesFound = 0;
+   uint8_t foundSprites[128];
++  /* Sprites and slivers the HARDWARE counts, see `counted` below. */
++  int rangeCounted = 0;
++  bool timeOverHit = false;
++  int rangeTiles = 0;
++  const bool wideMargins = ppu->extraLeftCur != 0 || ppu->extraRightCur != 0 ||
++                           ppu->extraLeftRight != 0;
+ 
+   /* Loop-invariant: neither obsel nor the interlace bit changes inside the
+    * walk. Hoisted for BOTH arms of the early-out A/B, so the toggle measures
+@@ -2795,14 +2809,24 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+                                           left_extra)) {
+         x = PpuAdjustWidescreenHudOamX(ppu, index, y, x);
+         if(x + spriteSize > -left_extra) {
+-          spritesFound++;
+-          if(spritesFound > 32 &&
+-             !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
+-            ppu->rangeOver = true;
+-            spritesFound = 32;
+-            break;
++          /* The hardware limits count only what the hardware can see: a
++           * sprite that intersects x 0..255. A sprite that lies only in a
++           * widescreen margin is off-screen on the real console, so it must
++           * neither use the 32-sprite budget nor be dropped by it. Without
++           * margins every sprite here intersects 0..255, as before. */
++          const bool counted = !g_ppu_margin_limits_hw ||
++                               (x < 256 && x + spriteSize > 0);
++          if (counted) {
++            if (++rangeCounted > 32 &&
++                !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
++              ppu->rangeOver = true;
++              rangeCounted = 32;
++              if (!wideMargins || !g_ppu_margin_limits_hw) break;
++              index += 2;
++              continue;
++            }
+           }
+-          foundSprites[spritesFound - 1] = index;
++          foundSprites[spritesFound++] = index;
+         }
+       }
+     }
+@@ -2836,10 +2860,19 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+          col + x >= 256 + right_extra)
+         continue;
+             tilesFound++;
+-            if(tilesFound > 34 &&
+-               !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
+-              ppu->timeOver = true;
+-              break;
++            /* As for the range limit: only a sliver the hardware fetches,
++             * one that intersects x 0..255, counts toward the 34. Once they
++             * are exhausted the hardware fetches nothing more, so later
++             * counted slivers are dropped, but margin-only ones still draw. */
++            if (!g_ppu_margin_limits_hw || (col + x > -8 && col + x < 256)) {
++              if (timeOverHit) continue;
++              if (++rangeTiles > 34 &&
++                  !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits)) {
++                ppu->timeOver = true;
++                timeOverHit = true;
++                if (!wideMargins || !g_ppu_margin_limits_hw) break;
++                continue;
++              }
+             }
+             int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
+       int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) |
+@@ -2880,10 +2913,16 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+                 ppu->objSlotOf[dst - ppu->objBuffer.data] = (uint8_t)slot;
+             }
+         }
+-        if(tilesFound > 34 &&
+-           !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits))
++        if(timeOverHit && (!wideMargins || !g_ppu_margin_limits_hw))
+       break;
+   }
++  /* A line the old rule would have cut: more than 32 sprites or 34 slivers
++   * in total, while the ones the hardware counts stayed within budget. */
++  if (wideMargins && g_ppu_margin_limits_hw &&
++      !(ppu->renderFlags & kPpuRenderFlags_NoSpriteLimits) &&
++      ((spritesFound > 32 && !ppu->rangeOver) ||
++       (tilesFound > 34 && !timeOverHit)))
++    ++g_ppu_margin_spared;
+   return tilesFound != 0;
+ }
+ 
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index ed27440..75a2f2d 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -567,6 +567,8 @@ void ppu_reset(Ppu* ppu);
+ bool ppu_checkOverscan(Ppu* ppu);
+ void ppu_handleVblank(Ppu* ppu);
+ void ppu_runLine(Ppu* ppu, int line);
++extern int g_ppu_margin_limits_hw;
++extern unsigned long g_ppu_margin_spared;
+ void ppu_sec_reset(void);
+ void ppu_sec_read(double *eval, double *line, double *bg, double *spr,
+                   double *compose, double *hdma);

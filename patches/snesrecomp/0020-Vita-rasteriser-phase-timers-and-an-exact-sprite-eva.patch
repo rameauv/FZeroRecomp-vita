@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 22:24:59 +0900
+Subject: [PATCH 20/33] Vita: rasteriser phase timers, and an exact sprite-eval
+ early-out
+
+Two things, both for the Vita host only.
+
+1. Per-phase timing (spriteEval / bg+mode7 / compose), measured DIRECTLY.
+   The upstream SNESRECOMP_INTERP_PROFILE split cannot be used: it does not
+   compile (missing PPU_T0_DECL in PpuDrawBackgrounds) and, once fixed,
+   reports eval/bg/sprites as 0.000 ms with everything in compose -- because
+   compose is derived by subtraction and the Mode 7 path carries no PPU_T0
+   sites at all. A phase with no probes is silently absorbed into the derived
+   one, which is indistinguishable from a phase that did no work.
+
+2. An early-out in ppu_evaluateSprites' range walk, behind
+   g_ppu_fast_sprite_eval so it can be A/B'd on the device.
+
+   The walk computed spriteSize -- a highOam shift plus a 2D table index --
+   for all 128 sprites on every scanline, before row < spriteHeight rejected
+   most of them. Since sizes[1] >= sizes[0] for every row of spriteSizes
+   (verified for all 8 objSize values, both interlace modes), a scanline past
+   the taller of the pair cannot intersect EITHER size, so rejecting on that
+   bound skips exactly the sprites the real test would reject.
+
+   Order, limits and the forward walk are untouched -- which matters, because
+   range evaluation walks OAM forward while tile fetching walks the accepted
+   list backward, and that ordering is observable at the 34-sliver cap.
+   rangeOver/timeOver are therefore unchanged, and the guest can read those
+   through $213E.
+
+   The loop-invariant hoists apply to BOTH arms, so the toggle measures the
+   early-out alone.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 50 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 47 insertions(+), 3 deletions(-)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 0b6f201..58ce571 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -22,6 +22,25 @@ extern unsigned char g_snesrecomp_last_hdmaen;
+ extern Snes *g_snes;
+ extern unsigned char g_snesrecomp_last_hdmaen;
+ 
++#if defined(__vita__)
++/* Per-phase rasteriser timing for the Vita host's heartbeat. The upstream
++ * SNESRECOMP_INTERP_PROFILE split does not work here: it reports eval/bg/
++ * sprites as zero and derives compose by subtraction, so a phase with no
++ * PPU_T0 sites (Mode 7 has none) is silently absorbed into compose. These
++ * three are measured directly and cross-checked against the caller's total. */
++#include <psp2/kernel/processmgr.h>
++uint64_t g_ppuprof_eval, g_ppuprof_bg, g_ppuprof_compose;
++/* A/B switch for the sprite range-evaluation early-out (see
++ * ppu_evaluateSprites). 1 = early-out on, 0 = original path. */
++int g_ppu_fast_sprite_eval = 1;
++#define VPROF_T0(v) uint64_t v = sceKernelGetProcessTimeWide()
++#define VPROF_ACC(acc, v) do { uint64_t _n = sceKernelGetProcessTimeWide(); \
++                               (acc) += _n - (v); (v) = _n; } while (0)
++#else
++#define VPROF_T0(v) do { } while (0)
++#define VPROF_ACC(acc, v) do { } while (0)
++#endif
++
+ #ifdef SNESRECOMP_INTERP_PROFILE
+ static double g_ppu_sec_eval_ms = 0;
+ static double g_ppu_sec_line_ms = 0;
+@@ -732,7 +751,9 @@ void ppu_runLine(Ppu* ppu, int line) {
+     if (ppu->overlayRenderBuffer[kPpuOverlaySource_Obj])
+       memset(&ppu->overlayBuffers[kPpuOverlaySource_Obj], 0,
+              sizeof(ppu->overlayBuffers[kPpuOverlaySource_Obj]));
+-    ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
++    { VPROF_T0(_ev);
++      ppu->lineHasSprites = !PPU_forcedBlank(ppu) && ppu_evaluateSprites(ppu, line - 1);
++      VPROF_ACC(g_ppuprof_eval, _ev); }
+ 
+     if (ppu->renderFlags & kPpuRenderFlags_NewRenderer) {
+       PPU_T0; PpuDrawWholeLine(ppu, line); PPU_ACC(g_ppu_sec_line_ms);
+@@ -2241,6 +2262,8 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+     return;
+   }
+ 
++  VPROF_T0(_ph);
++
+   // Default background is backdrop
+   ClearBackdrop(ppu, &ppu->bgBuffers[0]);
+ 
+@@ -2284,6 +2307,8 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   bool any_hud_full_width =
+       hud_full_width || oam_hud_full_width || anchor_full_width;
+ 
++  VPROF_ACC(g_ppuprof_bg, _ph);
++
+   // Color window affects the drawing mode in each region
+   PpuWindows cwin;
+   PpuWindows_Calc(&cwin, ppu, 5, y);
+@@ -2395,6 +2420,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
+ 
+   PpuWriteOverlayRenderLine(ppu, kPpuOverlaySource_Obj, y);
++  VPROF_ACC(g_ppuprof_compose, _ph);
+ }
+ 
+ static bool PpuWidescreenHudOamSlot(Ppu *ppu, uint8_t index, uint8_t y) {
+@@ -2508,13 +2534,31 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+   int tilesFound = 0;
+   uint8_t foundSprites[128];
+ 
++  /* Loop-invariant: neither obsel nor the interlace bit changes inside the
++   * walk. Hoisted for BOTH arms of the early-out A/B, so the toggle measures
++   * only the early-out itself. */
++  const uint8 *sizes = spriteSizes[PPU_objSize(ppu)];
++  const int interlaced = PPU_objInterlace(ppu) ? 1 : 0;
++  /* sizes[1] >= sizes[0] for every row of the table above, so a scanline past
++   * the taller of the pair cannot intersect EITHER size. Rejecting on that
++   * bound is exact -- it skips only sprites the real test rejects too -- and
++   * it avoids the highOam shift and table index for the ~120 sprites per line
++   * that do not intersect it. Order, limits and the forward walk are
++   * untouched, which matters: range evaluation walks OAM forward while tile
++   * fetching walks it backward, and that is observable at the 34-sliver cap. */
++  const int maxSpriteHeight = interlaced ? sizes[1] / 2 : sizes[1];
++  (void)maxSpriteHeight;   /* only read on the Vita early-out path */
++
+   // Range evaluation walks OAM forward, but tile fetching walks the accepted
+   // sprites backward. This is observable when the 34-sliver limit is reached.
+   for(int i = 0; i < 128; i++) {
+     uint8_t y = ppu->oam[index] >> 8;
+     uint8_t row = line - y;
+-    int spriteSize = spriteSizes[PPU_objSize(ppu)][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+-    int spriteHeight = PPU_objInterlace(ppu) ? spriteSize / 2 : spriteSize;
++#if defined(__vita__)
++    if (g_ppu_fast_sprite_eval && row >= maxSpriteHeight) { index += 2; continue; }
++#endif
++    int spriteSize = sizes[(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
++    int spriteHeight = interlaced ? spriteSize / 2 : spriteSize;
+     if(row < spriteHeight) {
+       int x = PpuDecodeOamX(ppu, index);
+       const int left_extra =

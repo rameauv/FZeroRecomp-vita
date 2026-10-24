@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 11:44:36 +0900
+Subject: [PATCH 12/33] Record emulation-mode transitions on the Vita host
+
+In emulation mode the 65816 forces M and X to 8-bit, so a REP #$30 cannot
+widen them and every following immediate decodes one byte short. Only XCE
+enters that mode, and its opcode ($FB) also occurs as the operand of the
+raster bands' BVC spin, so one mis-step into that byte flips the CPU into
+emulation and corrupts everything after it.
+
+Report the step either side of a flip, Vita-only, in the existing hook.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/interp_bridge.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 48eae3e..787c17f 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -1844,6 +1844,23 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+               if (s_prev_mapped && !_mapped)
+                 interp_bridge_note_offrails_vita(s_prev_pc, s_prev_op, s_prev_sp,
+                                                  pc_before, op);
++              /* Emulation-mode transitions. In emulation mode the 65816
++               * forces M and X to 8-bit, so a REP #$30 cannot widen them and
++               * every following immediate decodes one byte short. Only XCE
++               * ($FB) enters it, and $FB also appears as the operand of the
++               * bands' BVC spin -- so a single mis-step into that byte flips
++               * the CPU into emulation and corrupts everything after. Record
++               * the step that does it. */
++              { extern void interp_bridge_note_emulation_vita(
++                    uint32_t pc, uint8_t op, uint16_t sp, uint8_t to_e);
++                static int s_prev_e = -1;
++                int _e = in.e ? 1 : 0;
++                if (s_prev_e >= 0 && _e != s_prev_e)
++                  interp_bridge_note_emulation_vita(s_prev_pc, s_prev_op,
++                                                    in.sp, (uint8_t)_e);
++                s_prev_e = _e;
++              }
++
+               /* Entries into the raster handler region $00:8601-$00:8680.
+                * The host enters it only through bank_00_8601's AOT alias, so
+                * an LLE step arriving here from outside names whatever other

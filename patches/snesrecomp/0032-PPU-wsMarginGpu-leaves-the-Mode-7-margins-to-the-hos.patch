@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Tue, 29 Sep 2026 01:08:20 +0900
+Subject: [PATCH 32/33] PPU: wsMarginGpu leaves the Mode 7 margins to the host
+ GPU, and PpuMarginColorWindow
+
+With the flag set and m7MarginTiles bound, Mode 7 BG1 is not drawn outside
+[0,256) and the compose loop does not write the margins, so bgBuffers[0]
+holds the backdrop or the winning OBJ pixel there for the host to compose.
+Inert when the flag is clear: FBCRC and FLATCRC unchanged over 2,999 frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 47 +++++++++++++++++++++++++++++++++++++++++++
+ runner/src/snes/ppu.h | 17 ++++++++++++++++
+ 2 files changed, 64 insertions(+)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index af4ab81..ee832ac 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -343,6 +343,10 @@ void PpuSetMode7MarginTiles(Ppu *ppu, const uint8_t *tiles) {
+   ppu->m7MarginTiles = tiles;
+ }
+ 
++void PpuSetWidescreenMarginGpu(Ppu *ppu, bool on) {
++  ppu->wsMarginGpu = on ? 1 : 0;
++}
++
+ void PpuSetWidescreenCentreSkip(Ppu *ppu, bool skip) {
+   ppu->wsCentreSkip = skip ? 1 : 0;
+ }
+@@ -2149,6 +2153,8 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+           do dstz[i] = pixel + z; while (++i != w);
+         }
+       } while (xpos += dx * w, ypos += dy * w, dstz += w, w = PPU_mosaicSize(ppu), dstz_end - dstz != 0);
++    } else if (m7margin && (x2 <= 0 || x >= kPpuXPixels) && ppu->wsMarginGpu) {
++      continue;  // the host's GPU draws this span (Ppu::wsMarginGpu)
+     } else if (m7margin && (x2 <= 0 || x >= kPpuXPixels)) {
+       /* A margin span. The tile number comes from the host's per-column array
+        * instead of the tilemap word; everything else -- the outside-field
+@@ -2434,6 +2440,34 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
+   }
+ }
+ 
++int PpuMarginColorWindow(Ppu *ppu, int y) {
++  /* The same tests PpuDrawWholeLine makes before it widens cwin. Any of them
++   * means the margins compose differently, so the host must not model it. */
++  uint8 hud_height = ppu->wsHudSplitHeight & 0x7f;
++  if ((hud_height && y < hud_height && ppu->extraLeftRight) ||
++      ((ppu->wsHudSplitHeight & 0x80) && ppu->wsHudOamHeight) ||
++      PpuFullBudgetAnchorLayerAt(ppu, y) >= 0 ||
++      PpuWidescreenLineRepeatBandActive(ppu, y))
++    return -1;
++  PpuWindows cwin;
++  PpuWindows_Calc(&cwin, ppu, 5, y);
++  static const uint8 kCwBitsMod[8] = {
++    0x00, 0xff, 0xff, 0x00,
++    0xff, 0x00, 0xff, 0x00,
++  };
++  uint32 clip = (cwin.bits & kCwBitsMod[PPU_clipMode(ppu)]) ^ kCwBitsMod[PPU_clipMode(ppu) + 4];
++  uint32 math = (cwin.bits & kCwBitsMod[PPU_preventMathMode(ppu)]) ^ kCwBitsMod[PPU_preventMathMode(ppu) + 4];
++  int result = 0;
++  static const int kX[2] = { -1, kPpuXPixels };
++  for (int side = 0; side < 2; side++) {
++    uint32 w = 0;
++    while (w + 1 < cwin.nr && cwin.edges[w + 1] <= kX[side])
++      w++;
++    result |= ((clip >> w & 1) | (math >> w & 1) << 1) << (2 * side);
++  }
++  return result;
++}
++
+ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   PpuClearOverlayRenderLine(ppu, y);
+   if (PPU_forcedBlank(ppu)) {
+@@ -2526,9 +2560,22 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   if (g_ppu_fast_cgram_lut && !ppu->cgramLutValid)
+     PpuBuildCgramLut(ppu);
+ 
++  uint32 *const dst_first = dst;
++  const uint32 left_first = cwin.edges[0] + kPpuExtraLeftRight;
+   uint32 windex = 0;
+   do {
+     uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
++    if (ppu->wsMarginGpu) {
++      /* Keep only the part of the span inside the authentic 256 columns. The
++       * spans are contiguous from left_first, so dst is set from left rather
++       * than walked, and the margins of renderBuffer are left untouched. */
++      const uint32 c0 = kPpuExtraLeftRight, c1 = kPpuExtraLeftRight + kPpuXPixels;
++      if (left < c0) left = right < c0 ? right : c0;
++      if (right > c1) right = left > c1 ? left : c1;
++      if (left >= right)
++        continue;
++      dst = dst_first + (left - left_first);
++    }
+     /* The centre skip's second hand-done site (the first is ClearBackdrop).
+      * The drawers take it from the span BITS, but cwin's bits carry clip and
+      * colour-math state that the margins still need, so this span is dropped
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 75a2f2d..e49c408 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -352,6 +352,13 @@ struct Ppu {
+    * PpuWidescreenCentreSkipSafe for the per-line conditions that make the
+    * remaining margins byte-identical. */
+   uint8_t wsCentreSkip;
++  /* Leave the MARGINS to the host's GPU (strategy D). With this set and
++   * m7MarginTiles bound, Mode 7 BG1 is not drawn
++   * outside [0,256) and the compose loop does not write the margins of
++   * renderBuffer. Sprites still are, so after the line bgBuffers[0] holds, in
++   * the margins, the backdrop or the winning OBJ pixel with its z. The host
++   * composes BG1, OBJ and colour math from that. */
++  uint8_t wsMarginGpu;
+   uint32_t overlayRenderPitch[kPpuOverlaySource_Count];
+   uint8_t *overlayRenderBuffer[kPpuOverlaySource_Count];
+   uint8_t brightnessMult[32 + 31];
+@@ -694,6 +701,16 @@ void PpuSetMode7MarginTiles(Ppu *ppu, const uint8_t *tiles);
+ extern int g_ppu_line_write_src;
+ extern unsigned long g_ppu_line_writes[4][0x40];
+ 
++// See Ppu::wsMarginGpu. Set it per scanline, with m7MarginTiles bound.
++void PpuSetWidescreenMarginGpu(Ppu *ppu, bool on);
++
++// The colour window at the margins on scanline `y`, as the compose loop would
++// use it for x = -1 (bits 0..1) and x = 256 (bits 2..3). Per side, bit 0 set
++// means the main colour is kept (not clipped to black) and bit 1 set means
++// colour math may apply. -1 when the line composes in a widescreen HUD or
++// repeat mode, which this does not model.
++int PpuMarginColorWindow(Ppu *ppu, int y);
++
+ // Ask for the authentic centre to be skipped on the lines where it is safe.
+ // See Ppu::wsCentreSkip. Set it per scanline, after PpuSetExtraSpace* (which
+ // does not touch it), and only when PpuWidescreenCentreSkipSafe agrees.

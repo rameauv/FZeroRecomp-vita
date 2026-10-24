@@ -1,0 +1,5 @@
+/* Full-screen quad for the clear pass. */
+float4 main(float2 aPosition) : POSITION
+{
+    return float4(aPosition, 0.5f, 1.0f);
+}

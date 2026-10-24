@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 02:18:50 +0900
+Subject: [PATCH 09/33] Runner support for the PS Vita host
+
+Build/portability fixes so the runner cross-compiles under VitaSDK, plus
+the hooks the Vita host needs to diagnose guest-side failures.
+
+Portability:
+- host_paths.c: __APPLE__ is defined when cross-compiling for Vita on a
+  Mac, so the mach-o/dyld.h include and the _NSGetExecutablePath branch
+  were being selected for an ARM Vita target. Gate both on !__vita__.
+- sdl_compat.h: accept <SDL2/SDL.h> as well as <SDL.h>.
+- vita_getenv.c: getenv() stub for a platform with no environment. The
+  runner reads many SNESRECOMP_* vars for diagnostics; linked through
+  -Wl,--wrap=getenv.
+
+Diagnosis hooks. The Vita logs over UDP and has no usable stderr, so the
+existing FILE*-based dumps are unreachable there:
+- interp_bridge_recent_step() reads the interpreter's step ring
+  programmatically.
+- An optional (VITA-only) off-rails latch records the mapped -> unmapped
+  control-flow crossing at the instruction where it happens. The step
+  ring holds 8192 entries and a wedge in unmapped space runs far longer
+  than that, so by bail time the ring contains only the wedge loop and
+  the crossing itself is long gone.
+- common_rtl.c WriteReg: optional (VITA-only) callback on $2100-$213F
+  writes, so the host can trace the registers that decide whether a
+  frame renders at all.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/runner.cmake             |  1 +
+ runner/src/common_rtl.c         |  6 +++
+ runner/src/desktop/sdl_compat.h |  5 +++
+ runner/src/host_paths.c         |  7 +++-
+ runner/src/snes/interp_bridge.c | 69 +++++++++++++++++++++++++++++++--
+ runner/src/snes/interp_bridge.h |  5 +++
+ runner/src/vita_getenv.c        | 57 +++++++++++++++++++++++++++
+ 7 files changed, 144 insertions(+), 6 deletions(-)
+ create mode 100644 runner/src/vita_getenv.c
+
+diff --git a/runner/runner.cmake b/runner/runner.cmake
+index 1835dba..6b5ccb9 100644
+--- a/runner/runner.cmake
++++ b/runner/runner.cmake
+@@ -168,6 +168,7 @@ set(SNESRECOMP_RUNNER_SOURCES
+     ${SNESRECOMP_RUNNER_ROOT}/src/common_cpu_infra.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/common_rtl.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/widescreen.c
++    ${SNESRECOMP_RUNNER_ROOT}/src/vita_getenv.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/recomp_hw.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/framedump.c
+     ${SNESRECOMP_RUNNER_ROOT}/src/host_paths.c
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index 5888d1d..bbd9599 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -1400,6 +1400,12 @@ void WriteReg(uint16 reg, uint8 value) {
+     cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+     cart_write(g_snes->cart, 0, reg, value);
+   } else if (reg >= 0x2100 && reg < 0x2140) {
++#ifdef VITA
++    /* Vita bring-up probe: trace the display registers that decide whether a
++     * frame can show anything (INIDISP brightness / forced blank, TM/TS). */
++    { extern void FZeroLogPpuRegWrite(uint16 reg, uint8 value, int line);
++      FZeroLogPpuRegWrite(reg, value, g_snes ? (int)g_snes->vPos : -1); }
++#endif
+     ppu_write(g_ppu, reg & 0xff, value);
+     if (g_snes)
+       ppu_rasterRecord(reg, g_snes->vPos, value);
+diff --git a/runner/src/desktop/sdl_compat.h b/runner/src/desktop/sdl_compat.h
+index c75cc36..f1cad35 100644
+--- a/runner/src/desktop/sdl_compat.h
++++ b/runner/src/desktop/sdl_compat.h
+@@ -16,8 +16,13 @@
+ #include <SDL3/SDL.h>
+ #include <SDL3/SDL_main.h>
+ #else
++/* SDL2: try both <SDL.h> and <SDL2/SDL.h> */
++#if __has_include(<SDL2/SDL.h>)
++#include <SDL2/SDL.h>
++#else
+ #include <SDL.h>
+ #endif
++#endif
+ 
+ #define SNESRECOMP_SDL_MIX_MAXVOLUME 128
+ 
+diff --git a/runner/src/host_paths.c b/runner/src/host_paths.c
+index 75b7c80..2f1453f 100644
+--- a/runner/src/host_paths.c
++++ b/runner/src/host_paths.c
+@@ -22,8 +22,11 @@
+ #  define snesrecomp_chdir chdir
+ #  define snesrecomp_getcwd getcwd
+ #endif
++/* Only include macOS-specific headers when not cross-compiling for Vita */
+ #ifdef __APPLE__
+-#  include <mach-o/dyld.h>
++#  ifndef __vita__
++#    include <mach-o/dyld.h>
++#  endif
+ #endif
+ 
+ /* Full path of the running executable. Returns 1 on success. Platforms
+@@ -33,7 +36,7 @@ static int get_exe_path(char *out, size_t max_len) {
+ #if defined(_WIN32)
+     DWORD n = GetModuleFileNameA(NULL, out, (DWORD)max_len);
+     return (n > 0 && n < max_len) ? 1 : 0;
+-#elif defined(__APPLE__)
++#elif defined(__APPLE__) && !defined(__vita__)
+     uint32_t size = (uint32_t)max_len;
+     return _NSGetExecutablePath(out, &size) == 0 ? 1 : 0;
+ #elif defined(__linux__)
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index d646737..ebdaf4e 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -856,6 +856,39 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
+     }
+ }
+ 
++/* ── Always-on global interp step ring ─────────────────────────────────
++ * The per-run head[]/ring[] above are stack locals — invisible to a
++ * post-mortem or halt fired mid-run. This ring records EVERY interpreted
++ * step (pc, op, sp, frame) continuously so a late observer can read the
++ * interpreter's recent control flow backward (ring-buffer doctrine: no
++ * arm-then-capture). 8192 entries ≈ several frames of pure-interp code.
++ *
++ * Read it with interp_bridge_recent_step() below. There is deliberately no
++ * stderr dump here: upstream retired the g_interp_recent_dump_hook halt path
++ * in favour of the function-local ring, and the host that needs this one
++ * (the Vita port) has no usable stderr and logs over the network instead. */
++#define ITRACE_RECENT_LEN 8192
++typedef struct { uint32_t pc; int32_t frame; uint16_t sp; uint8_t op; uint8_t pad; } ITraceRecentEnt;
++static ITraceRecentEnt g_itrace_recent[ITRACE_RECENT_LEN];
++static uint64_t g_itrace_recent_n = 0;
++
++/* Programmatic read of the recent-step ring, for hosts with no usable stderr
++ * (the Vita port logs over the network). `back` is 1-based and counts
++ * backwards from the newest step. Returns 0 when `back` is out of range. */
++int interp_bridge_recent_step(int back, uint32_t *pc, uint8_t *op,
++                              uint16_t *sp, int32_t *frame) {
++    uint64_t have = g_itrace_recent_n < ITRACE_RECENT_LEN
++                        ? g_itrace_recent_n : ITRACE_RECENT_LEN;
++    if (back < 1 || (uint64_t)back > have) return 0;
++    const ITraceRecentEnt *e =
++        &g_itrace_recent[(g_itrace_recent_n - (uint64_t)back) & (ITRACE_RECENT_LEN - 1)];
++    if (pc) *pc = e->pc;
++    if (op) *op = e->op;
++    if (sp) *sp = e->sp;
++    if (frame) *frame = e->frame;
++    return 1;
++}
++
+ /* Tier-2 coverage table (definitions below, § gap manifest): shared by the
+  * tier-down entries AND the in-bridge gap recorders in the core loop. */
+ enum { TIER2_KIND_DISPATCH = 0, TIER2_KIND_INDIRECT_GOTO = 1,
+@@ -1787,6 +1820,34 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+             if (itn < 8) head[itn] = _e;
+             if (trace) ring[itn & 255] = _e;
+             itn++;
++            extern int snes_frame_counter;
++            ITraceRecentEnt *_g =
++                &g_itrace_recent[g_itrace_recent_n++ & (ITRACE_RECENT_LEN - 1)];
++            _g->pc = pc_before; _g->frame = snes_frame_counter;
++            _g->sp = in.sp; _g->op = op; _g->pad = 0;
++#ifdef VITA
++            /* Off-rails entry capture. A wedge in unmapped space runs far
++             * longer than the 8192-entry ring, so by bail time the ring holds
++             * only the wedge loop and the transition is long gone. Latch the
++             * crossing itself: the last mapped-bank step, and the first
++             * unmapped one. Cleared per frame by the host. */
++            { extern void interp_bridge_note_offrails_vita(uint32_t prev_pc,
++                                                           uint8_t prev_op,
++                                                           uint16_t prev_sp,
++                                                           uint32_t pc,
++                                                           uint8_t op);
++              static uint32_t s_prev_pc; static uint8_t s_prev_op;
++              static uint16_t s_prev_sp; static int s_prev_mapped;
++              uint8_t _bank = (uint8_t)(pc_before >> 16);
++              int _mapped = (_bank <= 0x07) || (_bank >= 0x80 && _bank <= 0x87) ||
++                            _bank == 0x7E || _bank == 0x7F;
++              if (s_prev_mapped && !_mapped)
++                interp_bridge_note_offrails_vita(s_prev_pc, s_prev_op, s_prev_sp,
++                                                 pc_before, op);
++              s_prev_pc = pc_before; s_prev_op = op; s_prev_sp = in.sp;
++              s_prev_mapped = _mapped;
++            }
++#endif
+         }
+         /* Env-gated diagnostic (SNESRECOMP_C2WATCH=1): log every interpreted
+          * opcode in the menu-blit range $C2:FC40-$C2:FF00 with the live mode
+@@ -1851,10 +1912,10 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                         "op=$%02X frame=%d sp=$%04X — corrupted control transfer\n",
+                         _pbnk, (unsigned)pc_before, op, snes_frame_counter,
+                         (unsigned)in.sp);
+-                    /* Step history at the trap. This branch had an
+-                     * always-on file-static ring (g_itrace_recent); main
+-                     * replaced it with the function-local one above, so use
+-                     * that instead of reviving a duplicate. `head` (first 8
++                    /* Step history at the trap. The always-on file-static
++                     * ring (g_itrace_recent) is readable only through
++                     * interp_bridge_recent_step; this stderr path uses the
++                     * function-local ring instead. `head` (first 8
+                      * steps) is always recorded; the 256-entry `ring` only
+                      * fills under SNESRECOMP_ITRACE, so pass total=0 when
+                      * untraced -- printing the entry path and claiming NO
+diff --git a/runner/src/snes/interp_bridge.h b/runner/src/snes/interp_bridge.h
+index 49231e6..607eaf9 100644
+--- a/runner/src/snes/interp_bridge.h
++++ b/runner/src/snes/interp_bridge.h
+@@ -57,6 +57,11 @@ void interp_bridge_set_pre_opcode_hook(uint32_t pc24,
+                                        InterpPreOpcodeHook hook);
+ void interp_bridge_pre_opcode_redirect(uint32_t pc24);
+ 
++/* Programmatic read of the same ring for hosts without a usable stderr.
++ * `back` is 1-based from the newest step; returns 0 if out of range. */
++int interp_bridge_recent_step(int back, uint32_t *pc, uint8_t *op,
++                              uint16_t *sp, int32_t *frame);
++
+ /*
+  * Run the interpreter over guest code at entry_pc24, in the context of `cpu`.
+  * `cpu` is updated in place. Returns:
+diff --git a/runner/src/vita_getenv.c b/runner/src/vita_getenv.c
+new file mode 100644
+index 0000000..99f6550
+--- /dev/null
++++ b/runner/src/vita_getenv.c
+@@ -0,0 +1,57 @@
++/*
++ * vita_getenv.c - Vita-specific getenv wrapper
++ *
++ * On PS Vita, the standard getenv() has a bug that returns 0x812a0000
++ * (a pointer to the .init_array section) instead of NULL for non-existent
++ * environment variables. This causes crashes when the code tries to
++ * dereference the pointer.
++ *
++ * Since Vita doesn't have a real environment like desktop systems,
++ * we wrap the standard getenv() and return NULL for all variables,
++ * disabling debug features on Vita.
++ */
++
++#include <string.h>
++
++/* Forward declaration of the real getenv function */
++extern char *__real_getenv(const char *name);
++
++/* Wrapper for getenv that returns NULL for all variables on Vita.
++ * This disables all debug/diagnostic features that rely on environment
++ * variables, which is appropriate for Vita where there's no real environment.
++ */
++char *__wrap_getenv(const char *name) {
++  /* Special case: SDL_VIDEODRIVER might be checked by SDL2 */
++  if (name && strcmp(name, "SDL_VIDEODRIVER") == 0) {
++    return NULL;  /* Let SDL2 use its default */
++  }
++  
++  /* Special case: SDL_AUDIODRIVER */
++  if (name && strcmp(name, "SDL_AUDIODRIVER") == 0) {
++    return NULL;  /* Let SDL2 use its default */
++  }
++  
++  /* All other environment variables: return NULL to disable features.
++   * This covers all SNESRECOMP_* and SNES_* variables used for
++   * debugging, cosimulation, netplay, etc. - features not needed
++   * in a standard Vita build. */
++  return NULL;
++}
++
++/* Provide a weak alias as well for additional safety */
++/* Note: __attribute__((alias)) is not supported on Darwin/macOS, so we use a
++   function definition there instead. On Vita, the linker will handle the alias. */
++#if defined(__APPLE__) || defined(__MACH__) || defined(__Darwin__)
++/* On macOS/Darwin, aliases are not supported, so provide a function definition */
++char *getenv(const char *name) {
++  return __wrap_getenv(name);
++}
++#elif defined(__vita__) || defined(VITA)
++/* On Vita (real hardware), use weak alias - the Vita linker supports this */
++__attribute__((weak, alias("__wrap_getenv"))) 
++char *getenv(const char *name);
++#else
++/* For other platforms, use weak alias if supported */
++__attribute__((weak, alias("__wrap_getenv"))) 
++char *getenv(const char *name);
++#endif

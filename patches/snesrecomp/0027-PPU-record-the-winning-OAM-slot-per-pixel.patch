@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Mon, 21 Sep 2026 07:09:37 +0900
+Subject: [PATCH 27/33] PPU: record the winning OAM slot per pixel
+
+The sprite pass already resolves a unique winner per pixel -- lower OAM
+indices are processed later and overwrite higher ones -- but throws the
+identity away, so a host that wants to know which sprite covered a pixel
+has to re-render the scanline once per OAM range it cares about.
+
+One byte store beside the existing dst[0] write keeps it. Read objSlotOf
+only where objBuffer's low byte is non-zero: the backdrop clear leaves
+0x0500 and every sprite store carries a non-zero palette index, so that
+byte is what distinguishes a pixel this line wrote from a stale one, and
+no per-line clear of the array is needed.
+
+Measured on the desktop build, race steady state: 3,558 stores/frame
+(max 7,433), so the cost on the native path is on the order of 16 us on
+a 444 MHz Cortex-A9.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 1 +
+ runner/src/snes/ppu.h | 7 +++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index c0581f2..83f9b0e 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -2745,6 +2745,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+               }
+         // Lower OAM indices are processed later and overwrite higher ones.
+                 dst[0] = z + pixel;
++                ppu->objSlotOf[dst - ppu->objBuffer.data] = (uint8_t)slot;
+             }
+         }
+         if(tilesFound > 34 &&
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 45f9b75..9946673 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -314,6 +314,13 @@ struct Ppu {
+   uint32_t renderFlags;
+   PpuPixelPrioBufs bgBuffers[2];
+   PpuPixelPrioBufs objBuffer;
++  /* Winning OAM slot per pixel of objBuffer, for the line just drawn. Read it
++   * only where objBuffer's low byte is non-zero: the backdrop clear writes
++   * 0x0500 and every sprite store carries a non-zero palette index, so a
++   * non-zero low byte is what says this line wrote both. It lets a host answer
++   * "which sprite covered this pixel" without re-rendering the line once per
++   * OAM range. Host-only derived state, never emulated state. */
++  uint8_t objSlotOf[kPpuBufWidth];
+   /* Per-source isolated priority pixels for generic host-overlay captures. */
+   PpuPixelPrioBufs overlayBuffers[kPpuOverlaySource_Count];
+   PpuOverlayCapture overlayCaptures[kPpuOverlaySource_Count];

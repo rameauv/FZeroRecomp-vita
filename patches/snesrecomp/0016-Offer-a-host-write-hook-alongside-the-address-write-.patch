@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 12:11:17 +0900
+Subject: [PATCH 16/33] Offer a host write hook alongside the address write log
+
+The address write log reports through a FILE, which a host with no usable
+filesystem path cannot use. Call a host hook from the same two sites so such a
+host can route the same information wherever it does have -- the Vita port
+logs over the network. Both sites cover every write path the existing log
+covers, including the DMA and $2180 stores that bypass cpu_write8.
+
+Compiles to nothing off Vita.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/cpu_state.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/runner/src/cpu_state.c b/runner/src/cpu_state.c
+index 56c9224..62c4117 100644
+--- a/runner/src/cpu_state.c
++++ b/runner/src/cpu_state.c
+@@ -154,6 +154,19 @@ static void wlog_addr_lazy(void) {
+     g_wlog_addr_state = getenv("SNESRECOMP_WLOG_STATE") != NULL;
+ }
+ 
++
++#ifdef VITA
++/* Vita stack-corruption watch. The wlog facility above logs to a FILE, which
++ * this host has no useful path for; route the same information to the network
++ * log instead. Reported through the host so the window and the address are the
++ * host's to choose. Covers every write path these two hooks cover, including
++ * the DMA and $2180 stores that bypass cpu_write8. */
++void FZeroWatchWrite(uint8 bank, uint16 addr, uint16 v, int width);
++#define FZERO_WATCH_WRITE(b, a, v, w) FZeroWatchWrite((b), (a), (v), (w))
++#else
++#define FZERO_WATCH_WRITE(b, a, v, w) ((void)0)
++#endif
++
+ static inline void wlog_addr_note(uint8 bank, uint16 addr, uint16 v, int width) {
+     if (addr < g_wlog_addr_lo || addr > g_wlog_addr_hi) return;
+     if (g_wlog_addr_n++ >= g_wlog_addr_cap) return;
+@@ -493,6 +506,7 @@ void cpu_write8(CpuState *cpu, uint8 bank, uint16 addr, uint8 v) {
+         cart_note_cpu_bus(g_snes->cart, bank, addr);
+     cpu->open_bus = v;
+     if (g_wlog_active) wlog_note(bank, addr, v, 1);
++    FZERO_WATCH_WRITE(bank, addr, v, 1);
+     if (g_wlog_addr_enabled) {
+         if (g_wlog_addr_enabled < 0) wlog_addr_lazy();
+         if (g_wlog_addr_enabled > 0) wlog_addr_note(bank, addr, v, 1);
+@@ -571,6 +585,7 @@ void cpu_write16(CpuState *cpu, uint8 bank, uint16 addr, uint16 v) {
+         cart_note_cpu_bus(g_snes->cart, bank, addr);
+     cpu->open_bus = (uint8)v;
+     if (g_wlog_active) wlog_note(bank, addr, v, 2);
++    FZERO_WATCH_WRITE(bank, addr, v, 2);
+     if (g_wlog_addr_enabled) {
+         if (g_wlog_addr_enabled < 0) wlog_addr_lazy();
+         if (g_wlog_addr_enabled > 0) wlog_addr_note(bank, addr, v, 2);
