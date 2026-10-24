@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 11:04:52 +0900
+Subject: [PATCH 10/33] Trace $4200-$421F writes on the Vita host
+
+The $2100-$213F probe added with the Vita host covers the display registers,
+but the raster split chain is armed through $4200 (NMI/IRQ enable) and
+$4207-$420A (H/V timer targets). Without those a host cannot tell an unarmed
+chain from a chain that armed and was never serviced.
+
+Vita-only, inside the existing #ifdef VITA probe pattern.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/common_rtl.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index bbd9599..d2ce982 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -1420,6 +1420,13 @@ void WriteReg(uint16 reg, uint8 value) {
+   } else if (reg >= 0x2180 && reg < 0x2184) {
+     snes_writeBBus(g_snes, reg & 0xff, value);
+   } else if (reg >= 0x4200 && reg < 0x4220) {
++#ifdef VITA
++    /* Vita bring-up probe: the raster split chain is armed through $4200
++     * (NMI/IRQ enable) and $4207-$420A (H/V timer targets). Trace those to
++     * see whether the chain is armed at all, and at which line. */
++    { extern void FZeroLogCpuRegWrite(uint16 reg, uint8 value, int line);
++      FZeroLogCpuRegWrite(reg, value, g_snes ? (int)g_snes->vPos : -1); }
++#endif
+     if (reg == 0x420C) {
+       g_snesrecomp_last_hdmaen = value;
+       /* Per-line fact: this title switches the transition's HDMA

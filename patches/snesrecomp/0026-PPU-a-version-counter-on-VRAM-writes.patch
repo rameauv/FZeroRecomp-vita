@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sun, 20 Sep 2026 21:48:48 +0900
+Subject: [PATCH 26/33] PPU: a version counter on VRAM writes
+
+A host that keeps a copy of VRAM needs to know whether it is still current.
+Comparing 64 KB to find out defeats the purpose, so count the writes instead:
+one increment on each of the four paths that can change vram[] -- ppu_write's
+$2118 and $2119, common_rtl's WriteVramWord, and the text-translation mod.
+
+Host-only and derived, never emulated state, and it sits outside the savestate
+snapshot region. Any new vram writer must bump it; the field comment says so.
+
+The first consumer is the widescreen pass, which copied all of VRAM into its
+scratch PPU once per scanline purely to stay in sync.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/common_rtl.c        | 1 +
+ runner/src/snes/ppu.c          | 2 ++
+ runner/src/snes/ppu.h          | 7 +++++++
+ runner/src/snes_text_xlate.cpp | 1 +
+ 4 files changed, 11 insertions(+)
+
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index 4bd330f..e470f44 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -1565,6 +1565,7 @@ uint16 ReadRegWord(uint16 reg) {
+ static void WriteVramWord(Ppu *ppu, uint16 value) {
+   uint16_t adr = ppu->vramPointer;
+   ppu->vram[adr & 0x7fff] = value;
++  ppu->vramVersion++;
+   // Atomic 16-bit STA $2118 hits both VRAM bytes at this word; record
+   // each as a byte event so the differ can compare against the
+   // oracle's REGISTER_2118 + REGISTER_2119 byte sequence.
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index d3094f5..c0581f2 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -3175,6 +3175,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+       // TODO: vram access during rendering (also cgram and oam)
+       uint16_t vramAdr = ppu_getVramRemap(ppu);
+       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
++      ppu->vramVersion++;
+       // $2118 == low byte of word; byte_addr = word << 1.
+       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
+ #if SNESRECOMP_ENABLE_MODS
+@@ -3188,6 +3189,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+     case 0x19: {
+       uint16_t vramAdr = ppu_getVramRemap(ppu);
+       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
++      ppu->vramVersion++;
+       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
+       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
+ #if SNESRECOMP_ENABLE_MODS
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 47edc41..45f9b75 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -338,6 +338,13 @@ struct Ppu {
+   uint32_t cgramLut[0x100];
+   bool cgramLutValid;
+ 
++  /* Bumped by every write into vram[]. Host-only and derived, never emulated
++   * state. It exists so a host holding a VRAM copy can tell whether it is
++   * still current without comparing 64 KB -- see fzero_wide_vram.h. Any new
++   * vram writer MUST bump it; the three today are ppu_write's $2118/$2119,
++   * common_rtl's WriteVramWord, and the text-translation mod. */
++  uint32_t vramVersion;
++
+   // Host-only widescreen state; excluded from savestates and cleared by reset.
+   PpuWidescreenLineEnhancer *widescreenLineEnhancer;
+   void *widescreenLineEnhancerContext;
+diff --git a/runner/src/snes_text_xlate.cpp b/runner/src/snes_text_xlate.cpp
+index 178a0c2..a54e176 100644
+--- a/runner/src/snes_text_xlate.cpp
++++ b/runner/src/snes_text_xlate.cpp
+@@ -311,6 +311,7 @@ uint8_t vram_read_byte(uint32_t byte_addr) {
+ 
+ void vram_write_byte(uint32_t byte_addr, uint8_t value) {
+     uint16_t& word = g_ppu->vram[(byte_addr >> 1) & 0x7fff];
++    g_ppu->vramVersion++;
+     if (byte_addr & 1)
+         word = static_cast<uint16_t>((word & 0x00ffu) |
+                                      (static_cast<uint16_t>(value) << 8));

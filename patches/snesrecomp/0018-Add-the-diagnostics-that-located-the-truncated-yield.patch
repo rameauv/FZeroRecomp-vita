@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 20:10:48 +0900
+Subject: [PATCH 18/33] Add the diagnostics that located the truncated yield
+ sentinel
+
+Logging only; no behavioural change. Kept because the reasoning they
+encode is easy to get wrong and expensive to re-derive.
+
+interp_bridge.c
+  - Records every paired-call bounce whose callee returned with the guest
+    return frame still exactly where the interpreter pushed it, with site,
+    target, _air, sp_pre/sp_post and the scheduler depth.
+  - NOTE at the bounce site documenting a blanket "pop the frame if it is
+    still there" repair that was tried and REVERTED. _sp_pre is sampled
+    WITH the frame already pushed, so consumed means sp_post == _sp_pre + fs
+    and leaked means sp_post == _sp_pre; two earlier attempts compared
+    against _sp_pre - fs, which is impossible and never fired. With the
+    arithmetic right the repair fires 121 times per 60 frames, all
+    RECOMP_RETURN_NORMAL, and 120 of them are correct as-is -- they were
+    truncated yields. Popping those strands an ancestor's return and fails
+    at once at the terminal RTL $03:8126 with the screen forced blank.
+    $03:8126 is the canary for over-popping; the old force_lle regression
+    produced the identical failure there.
+
+snes.c / common_rtl.c
+  - APU port read probe: first 8 reads plus a rolling last, each with
+    master_cycles, the frame-start anchor, the computed guest cycle and
+    apu->portClock. Used to exonerate the APU: the desktop build and this
+    one both perform exactly 279060 port reads during boot and reach an
+    identical portClock, so the SPC handshake and driver upload are not
+    where the two diverge.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/common_rtl.c         |  3 +++
+ runner/src/snes/interp_bridge.c | 34 ++++++++++++++++++++++++++++++++
+ runner/src/snes/snes.c          | 35 +++++++++++++++++++++++++++++++++
+ 3 files changed, 72 insertions(+)
+
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index d2ce982..15ffccc 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -1776,6 +1776,9 @@ void RtlApuWrite(uint16 adr, uint8 val) {
+ uint64_t apus_prof_calls = 0;
+ double apus_prof_ms = 0.0;
+ #endif
++uint64_t rtl_apu_guest_cycle_probe(void) { return rtl_apu_guest_cycle(); }
++uint64_t rtl_apu_frame_start_probe(void) { return g_apu_frame_start_master; }
++
+ void rtl_sync_apu_to_cpu_locked(void) {
+ #ifdef SNESRECOMP_INTERP_PROFILE
+   { extern uint64_t apus_prof_calls; extern double apus_prof_ms;
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 13906d9..519786d 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -769,6 +769,14 @@ void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
+ #ifndef SNESRECOMP_LLE_BOUNCE_DEFAULT
+ #define SNESRECOMP_LLE_BOUNCE_DEFAULT 1
+ #endif
++/* Count of paired-call return frames the bounce path had to pop itself
++ * (see the repair at the bounce site). Nonzero means generated bodies are
++ * returning NORMAL without consuming their guest return frame. */
++unsigned long g_interp_paired_frame_repairs = 0;
++struct InterpRepairLog { uint32_t target, site; int air; uint16_t sp_pre, sp_post; uint8_t fs; int sched_depth, in_sched, owner_depth; };
++struct InterpRepairLog g_interp_repair_log[8];
++unsigned long g_interp_bounce_imbalances = 0;
++unsigned long g_interp_frame_left_for_ancestor = 0;
+ static int s_scheduler_aot_policy = -1;
+ void interp_bridge_set_scheduler_aot_policy(int enabled) {
+     s_scheduler_aot_policy = enabled < 0 ? -1 : enabled != 0;
+@@ -2240,6 +2248,22 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                             "sp_pre=$%04X aot_ret=%d sp_post=$%04X\n",
+                             op, (unsigned)pc_before, (unsigned)target,
+                             (unsigned)_sp_pre, (int)_air, (unsigned)in.sp);
++                /* Unconditional observation point: EVERY bounce whose callee
++                 * did not leave S at the pre-call value, recorded here before
++                 * any of the exit branches below, so no path can hide it.
++                 * Two successive guesses at which branch leaks the return
++                 * frame both produced 0 hits, so measure instead of infer. */
++                if (in.sp == _sp_pre && g_interp_bounce_imbalances < 8) {
++                    struct InterpRepairLog *e =
++                        &g_interp_repair_log[g_interp_bounce_imbalances];
++                    e->target = target; e->site = pc_before;
++                    e->air = (int)_air; e->sp_pre = _sp_pre;
++                    e->sp_post = in.sp; e->fs = _fs;
++                    e->sched_depth = s_lle_sched_depth;
++                    e->in_sched = interp_bridge_in_lle_scheduler();
++                    e->owner_depth = s_interp_bounce_owner_depth;
++                    g_interp_bounce_imbalances++;
++                }
+                 const uint32_t ret =
+                     (pc_before + (uint32_t)call_len +
+                      (uint32_t)cpu_dispatch_inline_arg_bytes(target)) & 0xFFFFFF;
+@@ -2344,6 +2368,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                         return 1;
+                     }
+                 }
++                /* NOTE: a blanket "pop the frame if it is still there" repair was
++                 * tried here and REVERTED. Measurement says 121 bounces per 60
++                 * frames return NORMAL with the frame still at _sp_pre, and all
++                 * but one of them are CORRECT that way -- popping them strands an
++                 * ancestor's return and fails immediately at the terminal RTL
++                 * $03:8126 with the screen stuck forced-blank. "Frame still
++                 * present after a NORMAL return" is therefore not a bug
++                 * signature, and no local predicate separating the broken case
++                 * from the other 120 has been found. The one proven-bad target is
++                 * excluded from bouncing by the host instead. */
+                 in.k  = (uint8)((ret >> 16) & 0xFF);
+                 in.pc = (uint16)(ret & 0xFFFF);
+                 /* Resume-task mode: a successful bounce is forward progress
+diff --git a/runner/src/snes/snes.c b/runner/src/snes/snes.c
+index dc2a034..d086028 100644
+--- a/runner/src/snes/snes.c
++++ b/runner/src/snes/snes.c
+@@ -251,6 +251,18 @@ void snes_catchup_stats(uint64_t *calls, uint64_t *cycles) {
+   if (cycles) *cycles = s_catchup_cycles_total;
+ }
+ 
++
++/* TEMPORARY PROBE (Vita-vs-PC APU handshake divergence): capture the first 8
++ * APU-port reads with the guest timestamp that drives apu_runToGuestCycle.
++ * F-Zero's boot spins on CMP $2140 waiting for the SPC IPL to answer $BBAA;
++ * on PC that blocks for ~49.6k iterations, on Vita it matches immediately. */
++struct ApuPortProbe { unsigned adr; unsigned val; unsigned long long master,
++                      frame_start, guest_cycle, port_clock; int frame; };
++struct ApuPortProbe g_apu_port_probe[8];
++unsigned g_apu_port_probe_n = 0;
++unsigned long g_apu_port_reads_total = 0;
++struct ApuPortProbe g_apu_port_last;
++
+ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
+   if(adr < 0x40) {
+     return ppu_read(g_ppu, adr);
+@@ -262,6 +274,29 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
+     rtl_sync_apu_to_cpu_locked();
+     uint8_t v = snes->apu->outPorts[adr & 0x3];
+     v = rtl_apu_port_observers_read(0x2100 + adr, v);
++      g_apu_port_reads_total++;
++      { extern int snes_frame_counter;
++        extern uint64_t rtl_apu_guest_cycle_probe(void);
++        extern uint64_t rtl_apu_frame_start_probe(void);
++        struct ApuPortProbe *L = &g_apu_port_last;
++        L->adr = 0x2100u + adr; L->val = v;
++        L->master = (unsigned long long)g_cpu.master_cycles;
++        L->frame_start = (unsigned long long)rtl_apu_frame_start_probe();
++        L->guest_cycle = (unsigned long long)rtl_apu_guest_cycle_probe();
++        L->port_clock = (unsigned long long)snes->apu->portClock;
++        L->frame = snes_frame_counter; }
++      if (g_apu_port_probe_n < 8) {
++        extern int snes_frame_counter;
++        extern uint64_t rtl_apu_guest_cycle_probe(void);
++        extern uint64_t rtl_apu_frame_start_probe(void);
++        struct ApuPortProbe *e = &g_apu_port_probe[g_apu_port_probe_n++];
++        e->adr = 0x2100u + adr; e->val = v;
++        e->master = (unsigned long long)g_cpu.master_cycles;
++        e->frame_start = (unsigned long long)rtl_apu_frame_start_probe();
++        e->guest_cycle = (unsigned long long)rtl_apu_guest_cycle_probe();
++        e->port_clock = (unsigned long long)snes->apu->portClock;
++        e->frame = snes_frame_counter;
++      }
+     audio_trace_on_cpu_port_read((uint8_t)(adr & 0x3), v);
+     RtlApuUnlock();
+     return v;

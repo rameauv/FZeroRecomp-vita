@@ -1,0 +1,5 @@
+/* The frame texture, sampled as it is. The sampler is set to point filtering. */
+float4 main(float2 vTexcoord : TEXCOORD0, uniform sampler2D tex) : COLOR
+{
+    return tex2D(tex, vTexcoord);
+}

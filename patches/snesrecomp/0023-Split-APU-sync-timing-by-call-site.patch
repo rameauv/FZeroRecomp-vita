@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sun, 20 Sep 2026 00:00:11 +0900
+Subject: [PATCH 23/33] Split APU sync timing by call site
+
+Distinguishes the CPU-port catch-up (common_rtl.c:1815) from the
+frame-boundary catch-up (2028). They have different prospects: port-driven
+catch-up may batch, an end-of-frame catch-up of a whole frame's APU cycles is
+irreducible. Aggregate cost alone cannot tell them apart.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/common_rtl.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index 6acf783..aaf06ee 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -5,12 +5,16 @@
+  * not the recompiler. Measured here rather than inferred. ~268 calls/frame,
+  * so two timer reads each is ~360 us/frame; reported as apuprobe=. */
+ uint64_t g_apuprof_us; uint32_t g_apuprof_calls;
++uint64_t g_apuprof_port_us, g_apuprof_frame_us;
++uint32_t g_apuprof_port_calls, g_apuprof_frame_calls;
+ #define APU_T0 uint64_t _apu_t = sceKernelGetProcessTimeWide()
+-#define APU_ACC do { g_apuprof_us += sceKernelGetProcessTimeWide() - _apu_t; \
+-                     g_apuprof_calls++; } while (0)
++#define APU_ACC(site_us, site_calls) do { \
++    uint64_t _d = sceKernelGetProcessTimeWide() - _apu_t; \
++    g_apuprof_us += _d; g_apuprof_calls++; \
++    (site_us) += _d; (site_calls)++; } while (0)
+ #else
+ #define APU_T0 do { } while (0)
+-#define APU_ACC do { } while (0)
++#define APU_ACC(a,b) do { (void)0; } while (0)
+ #endif
+ #include "common_rtl.h"
+ #include "apu_frame_clock.h"
+@@ -1814,7 +1818,7 @@ void rtl_sync_apu_to_cpu_locked(void) {
+   APU_T0;
+   bool synced = apu_runToGuestCycle(g_snes->apu, rtl_apu_guest_cycle(),
+                                     1u << 20);
+-  APU_ACC;
++  APU_ACC(g_apuprof_port_us, g_apuprof_port_calls);
+   audio_trace_on_guest_sync(0, g_snes->apu->portClock - before);
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+   if (!synced)
+@@ -2025,7 +2029,7 @@ static void rtl_sync_apu_frame_boundary(void) {
+   APU_T0;
+   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
+                                     1u << 20);
+-  APU_ACC;
++  APU_ACC(g_apuprof_frame_us, g_apuprof_frame_calls);
+   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+   if (!synced)

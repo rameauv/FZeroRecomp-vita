@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 23:38:45 +0900
+Subject: [PATCH 22/33] Measure APU catch-up cost; gate the per-scanline PPU
+ probes
+
+PC sampling says cpu= is the APU, not the recompiler: APU 26.8% of leaf
+samples against the PPU's 63.9%, with recompiled guest code at 1.2%. The
+interpreter histogram agrees independently -- ~124 interpreted steps per
+frame, 185502 over 1500 frames across 160 PCs in banks $00 and $03. So AOT
+coverage is not a lever here.
+
+Times apu_runToGuestCycle at its two call sites in common_rtl.c rather than
+inferring the Vita figure from the PC ratio. Counted on PC first: 268
+calls/frame, so two timer reads each is ~360 us/frame.
+
+The per-scanline PPU phase probes now compile out unless FZERO_PPUPROF is
+defined; the phases they measure are characterised. Their accumulators stay
+defined so the host prints them without matching ifdefs.
+
+Also restores PPU_T0_DECL in PpuDrawBackgrounds, which the upstream
+SNESRECOMP_INTERP_PROFILE build needs to compile at all. It had been fixed
+only in the PC checkout and was lost on the next sync.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/common_rtl.c | 18 ++++++++++++++++++
+ runner/src/snes/ppu.c   |  7 +++++--
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index bb0d55d..6acf783 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -1,3 +1,17 @@
++#if defined(__vita__)
++#include <psp2/kernel/processmgr.h>
++/* APU catch-up cost. PC sampling puts ~27% of all work in the APU against the
++ * PPU's ~64%, with recompiled guest code at 1.2% -- so cpu= is mostly this,
++ * not the recompiler. Measured here rather than inferred. ~268 calls/frame,
++ * so two timer reads each is ~360 us/frame; reported as apuprobe=. */
++uint64_t g_apuprof_us; uint32_t g_apuprof_calls;
++#define APU_T0 uint64_t _apu_t = sceKernelGetProcessTimeWide()
++#define APU_ACC do { g_apuprof_us += sceKernelGetProcessTimeWide() - _apu_t; \
++                     g_apuprof_calls++; } while (0)
++#else
++#define APU_T0 do { } while (0)
++#define APU_ACC do { } while (0)
++#endif
+ #include "common_rtl.h"
+ #include "apu_frame_clock.h"
+ #include "common_cpu_infra.h"
+@@ -1797,8 +1811,10 @@ void rtl_sync_apu_to_cpu_locked(void) {
+   }
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
+   uint64_t before = g_snes->apu->portClock;
++  APU_T0;
+   bool synced = apu_runToGuestCycle(g_snes->apu, rtl_apu_guest_cycle(),
+                                     1u << 20);
++  APU_ACC;
+   audio_trace_on_guest_sync(0, g_snes->apu->portClock - before);
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+   if (!synced)
+@@ -2006,8 +2022,10 @@ static void rtl_sync_apu_frame_boundary(void) {
+   uint64_t boundary = g_extended_frame_timing
+       ? rtl_apu_clock_finish(&g_apu_frame_clock, g_cpu.master_cycles)
+       : (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME;
++  APU_T0;
+   bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
+                                     1u << 20);
++  APU_ACC;
+   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+   if (!synced)
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 2a4fc60..edb87e7 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -22,14 +22,13 @@ extern unsigned char g_snesrecomp_last_hdmaen;
+ extern Snes *g_snes;
+ extern unsigned char g_snesrecomp_last_hdmaen;
+ 
+-#if defined(__vita__)
++#if defined(__vita__) && FZERO_PPUPROF
+ /* Per-phase rasteriser timing for the Vita host's heartbeat. The upstream
+  * SNESRECOMP_INTERP_PROFILE split does not work here: it reports eval/bg/
+  * sprites as zero and derives compose by subtraction, so a phase with no
+  * PPU_T0 sites (Mode 7 has none) is silently absorbed into compose. These
+  * three are measured directly and cross-checked against the caller's total. */
+ #include <psp2/kernel/processmgr.h>
+-uint64_t g_ppuprof_eval, g_ppuprof_bg, g_ppuprof_compose;
+ /* A/B switch for the sprite range-evaluation early-out (see
+  * ppu_evaluateSprites). 1 = early-out on, 0 = original path. */
+ #define VPROF_T0(v) uint64_t v = sceKernelGetProcessTimeWide()
+@@ -39,6 +38,9 @@ uint64_t g_ppuprof_eval, g_ppuprof_bg, g_ppuprof_compose;
+ #define VPROF_T0(v) do { } while (0)
+ #define VPROF_ACC(acc, v) do { } while (0)
+ #endif
++/* Defined unconditionally so the host can print them without matching
++ * ifdefs; they simply stay zero when the probes are compiled out. */
++uint64_t g_ppuprof_eval, g_ppuprof_bg, g_ppuprof_compose;
+ 
+ /* A/B switch for the compose loop's hoisted widescreen-HUD test. Defined for
+  * every host, not just Vita: PC verifies that the fast path is pixel-exact,
+@@ -2157,6 +2159,7 @@ static void PpuFinishBackgroundOverlay(Ppu *ppu, uint y, bool sub,
+ }
+ 
+ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
++  PPU_T0_DECL   /* SNESRECOMP_INTERP_PROFILE: PPU_ACC below needs it */
+   // Top 4 bits contain the prio level, and bottom 4 bits the layer type.
+   // SPRITE_PRIO_TO_PRIO can be used to convert from obj prio to this prio.
+   //  15: BG3 tiles with priority 1 if bit 3 of $2105 is set

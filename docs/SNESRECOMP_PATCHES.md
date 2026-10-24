@@ -5,8 +5,9 @@
 | Integration on [craigshaw/snesrecomp](https://github.com/craigshaw/snesrecomp/tree/codex/fzero-upstream-20260914) | `da4a541713fd28702dd8c11c87a2c0fd69fcce45` |
 | Upstream base | `4d42cab33d02a8ce3dd5626ca2f2a7b91cedb628` |
 
-The ordered files under `patches/snesrecomp/` reproduce the integration
-from that base. Keep generic changes in the dependency and game-specific host
+The submodule is pinned to the integration commit. Patches 0001-0008 reproduce
+the integration from the upstream base. Patches 0009-0033 add the PS Vita
+runner on top of the integration; they exist only in this repository. Keep generic changes in the dependency and game-specific host
 code here.
 
 Recovery patches use LF line endings, enforced by `.gitattributes`, so
@@ -24,7 +25,13 @@ Recovery patches use LF line endings, enforced by `.gitattributes`, so
 | 0006 | Support the macOS system Bash, linker and context API in the C test harness. |
 | 0007 | Restrict the low-WRAM dynamic polling policy to S-DD1 cartridges. |
 | 0008 | Preserve eight-byte PPU priority-buffer alignment with MSVC, GCC and Clang; test C and C++ on Windows, Linux and macOS. |
-| 0009 | PS Vita host support: runner build, `getenv` shim, APU on a second core, PPU optimisations, and FZERO_DIAG probes. Applied on top of the pinned integration. |
+| 0009 | PS Vita host support in the runner. |
+| 0010-0016, 0018-0019 | Vita bring-up diagnostics: register and mode-transition traces, off-rails checks, a host write hook. All compile out unless the game enables `FZERO_DIAG`. |
+| 0017 | Widen `RecompReturn` so the LLE yield sentinel survives short enums. Required: without it the game wedges at frame 46. |
+| 0020-0023 | Rasteriser and APU timing probes, an exact sprite-evaluation early-out, and the widescreen-HUD test hoisted out of the compose loop. |
+| 0024 | Run the APU on a second core, paced by guest cycles. |
+| 0025-0031 | PPU support for the widescreen pass: compose palette table, VRAM and OAM/CGRAM version counters, the winning OAM slot per pixel, per-column Mode 7 margin tiles, hardware sprite limits. |
+| 0032-0033 | `wsMarginGpu`: leave Mode 7 margins, or whole Mode 7 lines, to the host GPU. |
 
 The previous HDMA ownership patch is retired. F-Zero now uses upstream's
 `snes_set_hdma_beam_enabled` interface around its per-line HDMA/render walk
@@ -42,10 +49,12 @@ git submodule update --init
 sh tools/apply_snesrecomp_patches.sh
 ```
 
-The submodule is pinned at the published integration commit. At that
-revision the script applies 0009 and accepts a repeated run. At the documented
-base, it applies all nine in order. It refuses an unexpected revision, and a
-patch that no longer applies because of local edits.
+At the integration pin, the script applies patches 0009 and later in order. At
+the upstream base, it applies all patches in order. A checkout that already
+contains the Vita commits is verified without applying patches. The script
+accepts a repeated run. It refuses an unexpected revision, and a checkout with
+edits that are not the patch stack. The applied patches stay as local changes
+in the submodule.
 
 ## Update the dependency
 
@@ -65,12 +74,63 @@ patch that no longer applies because of local edits.
    cargo test --manifest-path recompiler-rs/Cargo.toml
    ```
 
-3. Follow the [build instructions](../README.md#build-and-install) to regenerate and
-   rebuild the VPK. Exercise the affected route. Verify recovery,
+3. Follow the [build instructions](../README.md#build-from-source) to regenerate and
+   rebuild the game. Run CTest and exercise the affected route. Verify recovery,
    repeated application, and dirty-checkout refusal.
 4. Publish the integration before updating the parent pin. Update the recovery
    patches, verifier, and this document together.
 
 When upstream accepts a change, remove only its superseded recovery patch and
-revalidate the remaining stack. The script itself is covered by
-`uvx pytest tests/test_snesrecomp_patches.py`. Never edit the pinned dependency ad hoc.
+revalidate the remaining stack. Never edit the pinned dependency ad hoc.
+
+## September 2026 upgrade validation
+
+The integration uses the fixed upstream target above, with the retained fixes
+ported and tested before publication. Python generation from the unchanged
+cfg with `--cfg-roots` produces 678 exact AOT variants and 9 LLE variants,
+matching the previous baseline manifest structure. The Python and Rust
+analyzers each match their respective previous coverage after the trampoline
+patch. The current game build uses Python generation.
+
+On macOS arm64, the dependency Python suite passed 420 tests, the tier-2
+classifier passed three tests, and the separate exact-width regression passed.
+Rust passed 86 library tests and two analyzer tests. The full C suite passed,
+including 107 bridge tests. The host passed all four CTest tests and synthetic
+Metal GPU checks. Headless and Metal boot/attract runs each completed 1,800
+frames; the Metal run matched all protected-HUD RGB comparisons. The headless
+tier-2 capture and SRAM matched the previous baseline run.
+
+On 14 September 2026, the owner reported completing a full GP with no issues,
+including working saves, filters and modes. The league, difficulty and vehicle
+were not specified. This is the tested candidate's manual gameplay result,
+not a claim of complete game coverage. Existing release downloads remain
+unchanged.
+
+### Windows alignment follow-up
+
+Patch 0008 retains the required eight-byte alignment and unchanged priority
+buffer layout, using `__declspec(align(8))` for MSVC (including clang-cl) and
+the existing GNU alignment attribute for GCC and Clang. Both the struct tag
+and typedef carry the alignment. The synthetic test checks nested buffers,
+array strides, and stack, static and heap addresses in C and C++; removing
+the alignment makes the regression test fail at compile time.
+
+The [PPU alignment workflow](https://github.com/craigshaw/snesrecomp/actions/runs/34834925823)
+passed C and C++ tests on Windows/MSVC, Linux/GCC, Linux/Clang and
+macOS/Apple Clang. Local Windows checks also passed with MinGW GCC and LLVM
+Clang in C99, C11 and C++17 modes.
+
+The final pinned integration rebuilt successfully with MSVC x64 Release and
+SDL 3.4.16 after regeneration. All four host CTest tests and the Direct3D 12
+GPU presentation checks passed. Separate headless and Direct3D 12 boot/attract
+runs each completed 1,800 frames with RGB validation: all headless full frames
+and all GPU protected-HUD frames matched. These are automated smoke tests,
+not a new manual Grand Prix playthrough.
+
+The dependency v2 runner reported 420/420, including two C contract entries
+that explicitly skip on Windows. The separate exact-width regression passed.
+All eight recovery patches reconstruct the integration from the documented
+base and accept a repeated run. The seven recovery/classifier tests pass with
+normal Windows Git settings, including the dirty-checkout refusal cases.
+The full Linux/macOS game was not rebuilt for this alignment-only follow-up;
+the cross-platform CI checks exercise the shared PPU layout contract.

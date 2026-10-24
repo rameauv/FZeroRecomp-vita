@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 12:02:32 +0900
+Subject: [PATCH 15/33] Trip off-rails on leaving ROM, and report the stack
+ leaving page 1
+
+Page 0/1 was too narrow for a LoROM title with no RAM-resident code. Banks
+$00-$3F and $80-$BF hold ROM only at $8000-$FFFF; everything below is WRAM,
+registers or open bus. A capture caught a jump from $03:0258 to $03:01DA, but
+$03:02xx is WRAM as well, so execution had already left ROM and the approach
+held nothing but interpreted RAM bytes. Trip on the departure from ROM.
+
+That crossing also ran with S=00FF, outside the stack page, which is its own
+fault and precedes any control-flow damage. Report the first step that takes S
+out of $0100-$01FF.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/interp_bridge.c | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 1a389fd..13906d9 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -1847,7 +1847,17 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                * address like $03:01F1 and looks legitimate. This title keeps
+                * no code there -- direct page and stack only -- so treat it as
+                * a crossing and capture the approach that produced it. */
+-              if ((pc_before & 0xFFFFu) < 0x0200u) _mapped = 0;
++              /* This is a LoROM title with no RAM-resident code: banks
++               * $00-$3F and $80-$BF hold ROM only at $8000-$FFFF, and
++               * everything below that is WRAM, the register file or open bus.
++               * Page 0/1 was too narrow -- the capture caught a jump from
++               * $03:0258 to $03:01DA, but $03:02xx is WRAM too, so execution
++               * had already left ROM well before that and the approach showed
++               * nothing but interpreted RAM garbage. Trip on the departure
++               * from ROM itself. */
++              if ((_bank <= 0x3Fu || (_bank >= 0x80u && _bank <= 0xBFu)) &&
++                  (pc_before & 0xFFFFu) < 0x8000u)
++                _mapped = 0;
+               if (s_prev_mapped && !_mapped)
+                 interp_bridge_note_offrails_vita(s_prev_pc, s_prev_op, s_prev_sp,
+                                                  pc_before, op);
+@@ -1858,6 +1868,21 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                * bands' BVC spin -- so a single mis-step into that byte flips
+                * the CPU into emulation and corrupts everything after. Record
+                * the step that does it. */
++              /* The crossing above ran with sp=00FF: the stack had already
++               * grown down out of page 1, roughly 254 bytes of unbalanced
++               * pushes. That is its own fault and happens before the PC goes
++               * anywhere, so report the step that first takes S out of
++               * $0100-$01FF. */
++              { extern void interp_bridge_note_stack_escape_vita(
++                    uint32_t pc, uint8_t op, uint16_t sp);
++                static int s_stack_escaped;
++                if (!s_stack_escaped && (in.sp < 0x0100u || in.sp > 0x01FFu)) {
++                  s_stack_escaped = 1;
++                  interp_bridge_note_stack_escape_vita(s_prev_pc, s_prev_op,
++                                                       in.sp);
++                }
++              }
++
+               { extern void interp_bridge_note_emulation_vita(
+                     uint32_t pc, uint8_t op, uint16_t sp, uint8_t to_e);
+                 static int s_prev_e = -1;

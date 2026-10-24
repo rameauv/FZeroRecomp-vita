@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sun, 20 Sep 2026 17:09:48 +0900
+Subject: [PATCH 24/33] Run the APU on a second core, paced by guest cycles
+
+The SPC700 and S-DSP are a physically separate chip -- own crystal, own
+SRAM, four 8-bit latches as the only link to the 5A22 -- and emulating
+them on the game thread cost 5.7 ms of a 16.6 ms frame on the Vita.
+
+The game thread now publishes one target per frame (the guest cycle at
+the end of the frame it just completed) and a worker walks the SPC to
+that ceiling on another core. Determinism is preserved because the
+worker is paced by GUEST cycles, never wall-clock: port writes carry
+guest-cycle stamps, and writes issued during frame N+1 necessarily
+carry stamps at or beyond the ceiling, so which APU cycle each event
+lands on does not depend on how far the worker happens to have got.
+
+The advance is sliced (rtl_apu_worker_slice) because an unsliced one
+holds RtlApuLock for a third of a frame and every port write and audio
+callback would wait behind it. apu_runToGuestCycle already returns
+false on exhausting max_cycles with the ceiling unchanged, so slicing
+needs no new APU code and cannot change what the SPC computes.
+
+The interp bridge's pacing flushes had to go, not merely be left
+redundant: they would do the work on the game thread and push the SPC
+past the ceiling the worker is bounded by. The flush is split into
+PACING (skipped in worker mode) and RENDEZVOUS (the four APU-port bus
+accesses, kept -- there the guest really is waiting on the chip).
+
+Verified with the audio oracle on PC over 2,000 frames: worker on and
+worker off are BYTE-IDENTICAL, 1,944 of 1,999 frames non-silent, and
+the worker did the advancing (52,368 slices). x86 is strongly ordered,
+so this establishes the schedule, not thread safety on Cortex-A9 --
+which is why every access, including the uint64_t ceiling, is under
+RtlApuLock.
+
+Measured on device: -5,835 us/frame, 47.9 -> 59.5 FPS, late=0.
+
+Also: hoist mod_audio's "any active voice" test out of its per-frame
+loop. It is linked into the Vita build and read, clamped and wrote back
+every sample of every block with nothing playing -- 281 us per block on
+the audio thread, all of it inside the RtlApuLock hold.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/common_rtl.c         | 98 ++++++++++++++++++++++++++++++++-
+ runner/src/common_rtl.h         | 31 +++++++++++
+ runner/src/mod_audio.c          | 11 ++++
+ runner/src/snes/interp_bridge.c | 39 +++++++++++--
+ 4 files changed, 172 insertions(+), 7 deletions(-)
+
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index aaf06ee..4bd330f 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -234,6 +234,11 @@ static uint64_t g_apu_frame_start_master;
+ static RtlApuFrameClock g_apu_frame_clock;
+ static bool g_extended_frame_timing;
+ static bool g_apu_frame_time_valid;
++/* APU worker opt-in. Declared here rather than beside the rest of the worker
++ * state below because rtl_apu_pace_check, further up the file, has to consult
++ * it. Written only under RtlApuLock (RtlApuWorkerEnable); the reads are plain
++ * int loads of a value that changes at most once per A/B block. */
++static int g_rtl_apu_worker = 0;
+ 
+ bool rtl_apu_frame_timeline_active(void) {
+   return g_apu_frame_time_valid;
+@@ -1844,6 +1849,11 @@ void rtl_apu_pace_check(void) {
+    * blocks disturbs that pacing and can stall the vblank poll loop. Only
+    * pace once real frames are running. */
+   if (snes_frame_counter == 0) return;
++  /* Pacing exists so a long AOT block cannot leave the SPC frozen. With a
++   * worker advancing it continuously on another core there is nothing to
++   * unfreeze, and advancing here would both do the work on the wrong core
++   * and push the SPC past the frame ceiling the worker is bounded by. */
++  if (g_rtl_apu_worker) return;
+   uint64_t delta = g_cpu.master_cycles - g_apu_last_sync_master;
+   if (delta < 1024) return;
+   RtlApuLock();
+@@ -1996,6 +2006,74 @@ void rtl_apu_perf_snapshot(uint64_t *ns, uint64_t *calls) {
+     if (calls) *calls = s_apu_boundary_calls;
+ }
+ 
++/* ======================================================================
++ * APU worker (second core). See the contract in common_rtl.h and
++ * the on-device measurements.
++ *
++ * Every variable below, and g_rtl_apu_worker declared further up, is read and
++ * written ONLY under RtlApuLock. That is deliberate on a 32-bit weakly-ordered
++ * core: g_apu_worker_target is
++ * uint64_t, so an unlocked load is two 32-bit accesses and can tear, and the
++ * lock supplies the release/acquire pair that makes the queued port writes
++ * published before it visible to the other core. The cost is one acquisition
++ * per side per frame plus one per worker slice.
++ * ====================================================================== */
++static uint64_t g_apu_worker_target = 0;/* guest-cycle ceiling, frame ends only */
++static int      g_apu_worker_busy = 0;  /* ceiling not yet reached */
++static uint64_t g_apu_worker_slices = 0;/* slices executed                    */
++static uint64_t g_apu_worker_idle = 0;  /* polls that found the ceiling reached */
++static uint64_t g_apu_worker_late = 0;  /* publishes that found it still behind */
++
++void RtlApuWorkerEnable(int on) {
++  RtlApuLock();
++  g_rtl_apu_worker = on ? 1 : 0;
++  RtlApuUnlock();
++}
++
++int rtl_apu_worker_active(void) { return g_rtl_apu_worker; }
++
++int rtl_apu_worker_slice(uint32_t max_cycles) {
++  RtlApuLock();
++  if (!g_apu_worker_busy) {
++    g_apu_worker_idle++;
++    RtlApuUnlock();
++    return 0;
++  }
++  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_CPU);
++  uint64_t before = g_snes->apu->portClock;
++  /* max_cycles exhausted => returns false with the ceiling unchanged, so
++   * re-entering resumes exactly where this slice stopped. No APU-side state
++   * is needed to make the advance resumable. */
++  bool reached = apu_runToGuestCycle(g_snes->apu, g_apu_worker_target,
++                                     max_cycles);
++  audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
++  audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
++  g_apu_worker_slices++;
++  if (reached) g_apu_worker_busy = 0;
++  RtlApuUnlock();
++  return reached ? 0 : 1;
++}
++
++void rtl_apu_worker_stats(uint64_t *slices, uint64_t *idle, uint64_t *late) {
++  RtlApuLock();
++  if (slices) *slices = g_apu_worker_slices;
++  if (idle)   *idle   = g_apu_worker_idle;
++  if (late)   *late   = g_apu_worker_late;
++  RtlApuUnlock();
++}
++
++/* Hand the worker the frame just completed. Caller: game thread, once per
++ * frame, holding RtlApuLock. If the previous ceiling has not been reached the
++ * worker is behind real time -- that is the health metric to watch, not a
++ * correctness problem:
++ * raising the ceiling while it is still walking toward the old one is the
++ * same monotone sequence of targets, just later in host time. */
++static void rtl_apu_worker_publish_locked(uint64_t boundary) {
++  if (g_apu_worker_busy) g_apu_worker_late++;
++  if (boundary > g_apu_worker_target) g_apu_worker_target = boundary;
++  g_apu_worker_busy = 1;
++}
++
+ #ifdef SNESRECOMP_INTERP_PROFILE
+ #include <time.h>
+ uint64_t apub_prof_calls = 0;
+@@ -2027,8 +2105,16 @@ static void rtl_sync_apu_frame_boundary(void) {
+       ? rtl_apu_clock_finish(&g_apu_frame_clock, g_cpu.master_cycles)
+       : (uint64_t)snes_frame_counter * RTL_APU_CYCLES_PER_FRAME;
+   APU_T0;
+-  bool synced = apu_runToGuestCycle(g_snes->apu, boundary,
+-                                    1u << 20);
++  bool synced = true;
++  if (g_rtl_apu_worker) {
++    /* The worker owns advancement. Publishing is the whole of the game
++     * thread's APU work for this frame; the lock this function already holds
++     * is the one the contract requires, so publish inline rather than relying
++     * on the host mutex being recursive. */
++    rtl_apu_worker_publish_locked(boundary);
++  } else {
++    synced = apu_runToGuestCycle(g_snes->apu, boundary, 1u << 20);
++  }
+   APU_ACC(g_apuprof_frame_us, g_apuprof_frame_calls);
+   audio_trace_on_guest_sync(1, g_snes->apu->portClock - before);
+   audio_trace_set_producer(AUDIO_TRACE_PRODUCER_UNKNOWN);
+@@ -2141,6 +2227,12 @@ static double s_render_phase;      /* fractional native position, carried over *
+ static int16 s_render_hold_l;      /* last native delivered — fade anchor and  */
+ static int16 s_render_hold_r;      /* interpolation partner across calls       */
+ static int s_render_starved;       /* in a starvation episode (drives fade-in) */
++/* Starvation episodes and the frames lost to them, since boot. The APU worker
++ * runs the DSP a frame behind, so "is the ring deep enough" stopped being a
++ * question the target constant answers on its own -- this counts what
++ * actually happened instead of inferring it from an occupancy snapshot.
++ * Written only inside the render callback; read for logging. */
++uint64_t g_rtl_audio_starve_episodes = 0, g_rtl_audio_starve_frames = 0;
+ static int s_render_fade_pos;      /* fade-in progress, carried across calls   */
+ static double s_render_occ_ema = -1.0; /* burst-filtered occupancy, -1 = unset */
+ /* Host output rate. Defaults to the native rate, so a host that never calls
+@@ -2254,6 +2346,8 @@ static void rtl_render_native(Dsp *dsp, int16 *out, int frames) {
+   if (usable < frames) {
+     /* Fade the tail to silence over the remaining frames (capped) instead of
+      * cutting, then hold silence. */
++    if (!s_render_starved) g_rtl_audio_starve_episodes++;
++    g_rtl_audio_starve_frames += (uint64_t)(frames - usable);
+     s_render_starved = 1;
+     s_render_fade_pos = 0;
+     audio_trace_on_output_underflow(available, (uint32_t)(frames - usable));
+diff --git a/runner/src/common_rtl.h b/runner/src/common_rtl.h
+index ccb8fbd..212192b 100644
+--- a/runner/src/common_rtl.h
++++ b/runner/src/common_rtl.h
+@@ -71,6 +71,37 @@ void rtl_sync_apu_to_cpu_locked(void);
+  * AOT runs flush the SPC every ~1024 master cycles like the interp bridge. */
+ void rtl_apu_pace_check(void);
+ 
++/* ---- APU worker (second core) ----------------------------------------
++ *
++ * Off by default; the host opts in before the first RtlRunFrame. When on, the
++ * game thread stops advancing the SPC and instead publishes ONE target per
++ * frame -- the guest cycle at the end of the frame it just completed -- and a
++ * worker thread walks the SPC up to that ceiling on another core while the
++ * game thread runs the next frame.
++ *
++ * Determinism is preserved because the worker is paced by GUEST cycles, never
++ * wall-clock: the ceiling is a frame boundary, every queued port write is
++ * stamped with a guest cycle, and writes issued during frame N+1 necessarily
++ * carry stamps at or beyond that ceiling. Which APU cycle each event lands on
++ * is therefore independent of how far the worker happens to have got, exactly
++ * as it is independent of when the single-threaded build chose to flush.
++ * See the on-device measurements. */
++void RtlApuWorkerEnable(int on);
++int  rtl_apu_worker_active(void);
++/* Worker body, one bounded slice. Takes RtlApuLock, advances the SPC by at
++ * most max_cycles SPC cycles toward the published ceiling, releases it.
++ * Returns 1 while work remains (call again), 0 when the ceiling is reached.
++ * Slicing is what keeps the lock hold short enough that a game-thread port
++ * write or an audio callback does not wait behind a whole frame of SPC work;
++ * it does not affect which APU cycle anything lands on. */
++int  rtl_apu_worker_slice(uint32_t max_cycles);
++/* Worker instrumentation, read by the host's per-frame log. */
++void rtl_apu_worker_stats(uint64_t *slices, uint64_t *idle, uint64_t *late);
++/* Output-side starvation, counted rather than inferred: episodes and the
++ * output frames faded to silence. The only direct evidence that the DSP ring
++ * is deep enough with the APU running a frame behind. */
++extern uint64_t g_rtl_audio_starve_episodes, g_rtl_audio_starve_frames;
++
+ #ifdef SNES_COSIM
+ // Co-sim shared APU clock (SNES_COSIM_APU_SHARED=1, dev-only): pace the SPC
+ // purely from the HW-touch synthetic estimate on BOTH sides of a same-binary
+diff --git a/runner/src/mod_audio.c b/runner/src/mod_audio.c
+index 082f135..3121a6d 100644
+--- a/runner/src/mod_audio.c
++++ b/runner/src/mod_audio.c
+@@ -280,6 +280,17 @@ void snes_mod_audio_mix(int16_t *dst, int frame_count, uint32_t output_rate,
+     if (!dst || frame_count <= 0 || output_rate < 8000 || output_rate > 192000 ||
+         (output_channels != 1 && output_channels != 2))
+         return;
++    /* Nothing playing is the normal case -- and on a build with mods compiled
++     * out it is the ONLY case, since no voice can ever be created. Test it
++     * once per block instead of once per output frame: without this the loop
++     * below still reads, clamps and writes back every sample of every block
++     * to accomplish nothing. Measured on the Vita's audio thread at 281 us
++     * per 800-frame block, ~440 us per game frame, all of it inside the
++     * RtlApuLock hold that the APU worker contends with. */
++    int any_active = 0;
++    for (int v = 0; v < SNES_MOD_AUDIO_MAX_VOICES; ++v)
++        if (s_voices[v].clip != SNES_MOD_AUDIO_CLIP_INVALID) { any_active = 1; break; }
++    if (!any_active) return;
+     for (int frame = 0; frame < frame_count; ++frame) {
+         int64_t mixed[2] = { dst[(size_t)frame * output_channels], 0 };
+         if (output_channels == 2) mixed[1] = dst[(size_t)frame * 2 + 1];
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 0e9d63c..030f83b 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -71,8 +71,37 @@ double apu_prof_ms = 0.0;
+ uint64_t bridgeq_prof_calls = 0;
+ double bridgeq_prof_ms = 0.0;
+ #endif
+-static void bridge_apu_flush(CpuState *cpu) {
++/* Two kinds of caller share this flush, and the APU worker separates them.
++ *
++ *  - RENDEZVOUS: an APU-port bus access is about to happen, so the SPC must
++ *    be current before it. Four sites, all in bridge_bus_read/write. These
++ *    run in worker mode too: the guest is genuinely waiting on the chip.
++ *  - PACING: the periodic ~1024-master-cycle flush and the bridge/bounce
++ *    exits. These exist only so a long run of guest code cannot leave the
++ *    SPC frozen -- interp_bridge's own comment above. A worker advancing the
++ *    SPC on another core makes them not merely redundant but wrong: they
++ *    would do the work on the game thread (the entire point is to move it
++ *    off) and push the SPC past the frame ceiling the worker is bounded by,
++ *    which is what keeps the schedule deterministic.
++ *
++ * Skipping a pacing flush does not change which APU cycle anything lands on.
++ * Port writes carry guest-cycle stamps (apu_schedulePortWrite), so they are
++ * applied at the same SPC cycle whether the advance happens now or later --
++ * the same argument as "flushing early is always correct", run backwards.
++ *
++ * The macro keeps the ~25 pacing call sites untouched; only the four
++ * rendezvous sites name the _ex form. */
++#define bridge_apu_flush(cpu) bridge_apu_flush_ex((cpu), 0)
++static void bridge_apu_flush_ex(CpuState *cpu, int rendezvous) {
+     if (!s_apu_pending_master) return;
++    if (!rendezvous && rtl_apu_worker_active()) {
++        /* Charge the cycles so a later rendezvous (or the non-worker path, if
++         * the toggle is flipped) does not double-count them, and keep the
++         * last-sync anchor moving so the AOT hook's delta stays honest. */
++        g_apu_last_sync_master = cpu->master_cycles;
++        s_apu_pending_master = 0;
++        return;
++    }
+ #ifdef SNESRECOMP_INTERP_PROFILE
+     { extern uint64_t apu_prof_calls; extern double apu_prof_ms;
+       apu_prof_calls++; }
+@@ -198,7 +227,7 @@ static uint8_t bridge_bus_read(void *mem, uint32_t adr) {
+     bridge_timing_bus(adr);
+     int continuous=bridge_continuous_read(adr);
+     if (continuous) s_interp_continuous_read_epoch++;
+-    if (bridge_is_apu_port(adr)) bridge_apu_flush(cpu);
++    if (bridge_is_apu_port(adr)) bridge_apu_flush_ex(cpu, 1);
+     uint8_t value=cpu_read8(cpu,(uint8)((adr>>16)&0xff),(uint16)adr);
+     if (continuous) {
+         BridgeDynamicValue *d=&s_bridge_dynamic_values[(adr^(adr>>8)^(adr>>16))&63];
+@@ -236,7 +265,7 @@ static void bridge_bus_write(void *mem, uint32_t adr, uint8_t val) {
+         if(reports++<131072) fprintf(stderr,"[apu_port] write $%04X=%02X master=%llu\n",
+           (unsigned)(uint16_t)adr,val,(unsigned long long)cpu->master_cycles);
+     }
+-    if (is_apu_port) bridge_apu_flush(cpu);
++    if (is_apu_port) bridge_apu_flush_ex(cpu, 1);
+     cpu_write8(cpu, (uint8)((adr >> 16) & 0xFF), (uint16)(adr & 0xFFFF), val);
+     /* Re-sync the SPC after the port write so it can see the new data.
+      * bridge_apu_flush above consumed s_apu_pending_master, so calling it
+@@ -279,7 +308,7 @@ static bool bridge_bus_read_word(void *mem, uint32_t adrl, uint32_t adrh,
+         s_interp_continuous_read_epoch++;
+     CpuState *cpu = (CpuState *)mem;
+     const int is_apu_port = bridge_is_apu_port(adrl);
+-    if (is_apu_port) bridge_apu_flush(cpu);
++    if (is_apu_port) bridge_apu_flush_ex(cpu, 1);
+     *out = cpu_read16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF));
+     if ((uint16_t)adrl == 0x2140 && bridge_apu_port_diag_enabled()) {
+         static uint16_t last=0xffff; static unsigned reports;
+@@ -316,7 +345,7 @@ static bool bridge_bus_write_word(void *mem, uint32_t adrl, uint32_t adrh,
+         if(reports++<131072) fprintf(stderr,"[apu_port] writew $%04X=%04X master=%llu\n",
+           (unsigned)(uint16_t)adrl,val,(unsigned long long)cpu->master_cycles);
+     }
+-    if (is_apu_port) bridge_apu_flush(cpu);
++    if (is_apu_port) bridge_apu_flush_ex(cpu, 1);
+     cpu_write16(cpu, (uint8)((adrl >> 16) & 0xFF), (uint16)(adrl & 0xFFFF), val);
+     /* Re-sync SPC after port write so it can see the new data (same as
+      * bridge_bus_write byte path). */

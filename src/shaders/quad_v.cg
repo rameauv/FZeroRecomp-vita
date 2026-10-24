@@ -1,0 +1,7 @@
+/* Screen-space textured quad. Positions arrive in clip space. */
+void main(float2 aPosition, float2 aTexcoord,
+          out float4 vPosition : POSITION, out float2 vTexcoord : TEXCOORD0)
+{
+    vPosition = float4(aPosition, 0.5f, 1.0f);
+    vTexcoord = aTexcoord;
+}

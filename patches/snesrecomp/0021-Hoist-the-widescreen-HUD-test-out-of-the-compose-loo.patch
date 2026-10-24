@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 23:17:36 +0900
+Subject: [PATCH 21/33] Hoist the widescreen-HUD test out of the compose loop
+
+compose is the largest PPU phase on Vita (5137 us/frame, 41% of the measured
+rasteriser). Its per-pixel body recomputed a blanking test that depends only
+on i and on booleans already fixed for the scanline:
+
+  outside_world = i < hud_world_left || i >= hud_world_right
+  keep_hud      = three comparisons against main_layer
+
+All three *_full_width flags require ppu->extraLeftRight to be nonzero, and
+with widescreen off hud_world is [272, 528) while the window span is exactly
+272..528 -- so the test can never blank a pixel, yet paid two range checks per
+pixel plus, in the no-math loop, a nibble extract and three comparisons.
+
+Decided once per window span into hud_checks_needed. Behind
+g_ppu_fast_compose so it can be A/B'd on device.
+
+Also un-gates g_ppu_fast_sprite_eval from __vita__ so PC can verify it too.
+Both paths are now proven pixel-exact: byte-identical framebuffer hashes over
+3999 frames spanning 2520 distinct images.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 60 +++++++++++++++++++++++++++++--------------
+ 1 file changed, 41 insertions(+), 19 deletions(-)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index 58ce571..2a4fc60 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -32,7 +32,6 @@ extern unsigned char g_snesrecomp_last_hdmaen;
+ uint64_t g_ppuprof_eval, g_ppuprof_bg, g_ppuprof_compose;
+ /* A/B switch for the sprite range-evaluation early-out (see
+  * ppu_evaluateSprites). 1 = early-out on, 0 = original path. */
+-int g_ppu_fast_sprite_eval = 1;
+ #define VPROF_T0(v) uint64_t v = sceKernelGetProcessTimeWide()
+ #define VPROF_ACC(acc, v) do { uint64_t _n = sceKernelGetProcessTimeWide(); \
+                                (acc) += _n - (v); (v) = _n; } while (0)
+@@ -41,6 +40,14 @@ int g_ppu_fast_sprite_eval = 1;
+ #define VPROF_ACC(acc, v) do { } while (0)
+ #endif
+ 
++/* A/B switch for the compose loop's hoisted widescreen-HUD test. Defined for
++ * every host, not just Vita: PC verifies that the fast path is pixel-exact,
++ * Vita measures what it is worth. 1 = hoist on, 0 = original path. */
++int g_ppu_fast_compose = 1;
++/* Same, for the sprite range-evaluation early-out. Also defined for every
++ * host so PC can prove it pixel-exact. */
++int g_ppu_fast_sprite_eval = 1;
++
+ #ifdef SNESRECOMP_INTERP_PROFILE
+ static double g_ppu_sec_eval_ms = 0;
+ static double g_ppu_sec_line_ms = 0;
+@@ -2345,6 +2352,16 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   uint32 windex = 0;
+   do {
+     uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
++    /* The per-pixel widescreen-HUD blanking test depends only on i and on
++     * booleans already fixed for this scanline. If no full-width HUD is
++     * active AND this span lies entirely inside the world, it can never
++     * blank a pixel, so it is decided once here instead of per pixel --
++     * removing two range checks and, in the no-math loop, a nibble extract
++     * and three comparisons from every pixel. With widescreen off it is
++     * always inert: hud_world is [272, 528) and the span is exactly that. */
++    const bool hud_checks_needed =
++        !g_ppu_fast_compose || any_hud_full_width ||
++        left < hud_world_left || right > hud_world_right;
+     // If clip is set, then zero out the rgb values from the main screen.
+     uint32 clip_color_mask = (cw_clip_math & 1) ? 0x1f : 0;
+     uint32 math_enabled_cur = PPU_mathEnabled(ppu) & ((cw_clip_math & 0x100) ? -1 : 0);
+@@ -2354,14 +2371,18 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+       uint32 i = left;
+       do {
+         uint16 pixel = ppu->bgBuffers[0].data[i];
+-        bool outside_world = i < hud_world_left || i >= hud_world_right;
+-        const uint8 main_layer = (pixel >> 8) & 0xf;
+-        const bool keep_hud =
+-            (hud_full_width && main_layer == 2) ||
+-            (anchor_full_width && main_layer == anchor_full_layer) ||
+-            (oam_hud_full_width &&
+-             (main_layer == 4 || main_layer == 6));
+-        if (outside_world && !keep_hud) {
++        bool blank = false;
++        if (hud_checks_needed) {
++          bool outside_world = i < hud_world_left || i >= hud_world_right;
++          const uint8 main_layer = (pixel >> 8) & 0xf;
++          const bool keep_hud =
++              (hud_full_width && main_layer == 2) ||
++              (anchor_full_width && main_layer == anchor_full_layer) ||
++              (oam_hud_full_width &&
++               (main_layer == 4 || main_layer == 6));
++          blank = outside_world && !keep_hud;
++        }
++        if (blank) {
+           dst[0] = 0;
+         } else {
+           uint32 color = ppu->cgram[pixel & 0xff];
+@@ -2379,13 +2400,17 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+       do {
+         uint16 pixel = ppu->bgBuffers[0].data[i];
+         uint8 main_layer = (pixel >> 8) & 0xf;
+-        bool outside_world = i < hud_world_left || i >= hud_world_right;
+-        const bool keep_hud =
+-            (hud_full_width && main_layer == 2) ||
+-            (anchor_full_width && main_layer == anchor_full_layer) ||
+-            (oam_hud_full_width &&
+-             (main_layer == 4 || main_layer == 6));
+-        if (outside_world && !keep_hud) {
++        bool blank = false;
++        if (hud_checks_needed) {
++          bool outside_world = i < hud_world_left || i >= hud_world_right;
++          const bool keep_hud =
++              (hud_full_width && main_layer == 2) ||
++              (anchor_full_width && main_layer == anchor_full_layer) ||
++              (oam_hud_full_width &&
++               (main_layer == 4 || main_layer == 6));
++          blank = outside_world && !keep_hud;
++        }
++        if (blank) {
+           dst[0] = 0;
+         } else {
+           uint32 color = ppu->cgram[pixel & 0xff], color2;
+@@ -2547,16 +2572,13 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
+    * untouched, which matters: range evaluation walks OAM forward while tile
+    * fetching walks it backward, and that is observable at the 34-sliver cap. */
+   const int maxSpriteHeight = interlaced ? sizes[1] / 2 : sizes[1];
+-  (void)maxSpriteHeight;   /* only read on the Vita early-out path */
+ 
+   // Range evaluation walks OAM forward, but tile fetching walks the accepted
+   // sprites backward. This is observable when the 34-sliver limit is reached.
+   for(int i = 0; i < 128; i++) {
+     uint8_t y = ppu->oam[index] >> 8;
+     uint8_t row = line - y;
+-#if defined(__vita__)
+     if (g_ppu_fast_sprite_eval && row >= maxSpriteHeight) { index += 2; continue; }
+-#endif
+     int spriteSize = sizes[(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+     int spriteHeight = interlaced ? spriteSize / 2 : spriteSize;
+     if(row < spriteHeight) {

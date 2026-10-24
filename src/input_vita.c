@@ -1,7 +1,5 @@
 /*
- * input_vita.c - PS Vita controller input handling for FZeroRecomp
- *
- * Based on patterns from sm64-vita's controller_vita.c
+ * input_vita.c - PS Vita controller input for FZeroRecomp.
  *
  * Reads the Vita pad once per frame and maps it onto the runner's 12-bit
  * SNES controller word.
@@ -18,26 +16,19 @@
 
 #include "platform.h"
 
-/* ========================================================================
- * LOCAL DEFINITIONS
- * ======================================================================== */
-
-/* SNES input button masks (12-bit serial controller format) */
-/* Matches snesrecomp runner format: */
-/* B=0x001, Y=0x002, SELECT=0x004, START=0x008, UP=0x010, DOWN=0x020, */
-/* LEFT=0x040, RIGHT=0x080, A=0x100, X=0x200, L=0x400, R=0x800 */
-#define SNES_INPUT_B       (1 << 0)   /* 0x001 */
-#define SNES_INPUT_Y       (1 << 1)   /* 0x002 */
-#define SNES_INPUT_SELECT  (1 << 2)   /* 0x004 */
-#define SNES_INPUT_START   (1 << 3)   /* 0x008 */
-#define SNES_INPUT_UP      (1 << 4)   /* 0x010 */
-#define SNES_INPUT_DOWN    (1 << 5)   /* 0x020 */
-#define SNES_INPUT_LEFT    (1 << 6)   /* 0x040 */
-#define SNES_INPUT_RIGHT   (1 << 7)   /* 0x080 */
-#define SNES_INPUT_A       (1 << 8)   /* 0x100 */
-#define SNES_INPUT_X       (1 << 9)   /* 0x200 */
-#define SNES_INPUT_L       (1 << 10)  /* 0x400 */
-#define SNES_INPUT_R       (1 << 11)  /* 0x800 */
+/* The runner's 12-bit SNES controller word. */
+#define SNES_INPUT_B       (1 << 0)
+#define SNES_INPUT_Y       (1 << 1)
+#define SNES_INPUT_SELECT  (1 << 2)
+#define SNES_INPUT_START   (1 << 3)
+#define SNES_INPUT_UP      (1 << 4)
+#define SNES_INPUT_DOWN    (1 << 5)
+#define SNES_INPUT_LEFT    (1 << 6)
+#define SNES_INPUT_RIGHT   (1 << 7)
+#define SNES_INPUT_A       (1 << 8)
+#define SNES_INPUT_X       (1 << 9)
+#define SNES_INPUT_L       (1 << 10)
+#define SNES_INPUT_R       (1 << 11)
 
 /* Player 1 connected indicator, as the desktop host reports it. */
 #define SNES_CONTROLLER_P1_ACTIVE (1u << 30)
@@ -55,12 +46,14 @@
  * which keeps a resting thumb from steering. */
 #define ANALOG_DIGITAL_THRESHOLD 48
 
-/* START + SELECT must be held this many frames (~1s at 60fps) to quit. */
-#define QUIT_HOLD_FRAMES 60
+/* L + R + START must be held this many frames (~0.17s at 60fps) to soft-reset
+ * the SNES. F-Zero sometimes locks up with no way back to the title screen. */
+#define RESET_HOLD_FRAMES 10
 
-/* ========================================================================
- * GLOBAL STATE
- * ======================================================================== */
+/* START + SELECT held this many frames (~0.08s at 60fps) writes battery SRAM
+ * to disk on demand. SELECT is unused by F-Zero, so the combo can't collide
+ * with gameplay. */
+#define SAVE_HOLD_FRAMES 5
 
 static bool g_input_initialized = false;
 
@@ -68,12 +61,24 @@ static bool g_input_initialized = false;
 static SceCtrlData g_ctrl;
 static bool g_ctrl_valid = false;
 
-/* Consecutive frames the quit combo has been held. */
-static uint32_t g_quit_hold_frames = 0;
+/* Consecutive frames the reset combo has been held. */
+static uint32_t g_reset_hold_frames = 0;
 
-/* ========================================================================
- * INITIALIZATION
- * ======================================================================== */
+/* Set when the reset combo fires; stays set until L, R and START are all
+ * released. While set, the combo counter cannot re-accumulate (the player is
+ * usually still holding the buttons when RtlReset returns) and input_read
+ * reports neutral, so the held START does not leak into the freshly reset
+ * game as a phantom press. */
+static bool g_reset_latched = false;
+
+/* Consecutive frames the save combo (START + SELECT) has been held. */
+static uint32_t g_save_hold_frames = 0;
+
+/* Set when the save combo fires; stays set until START and SELECT are both
+ * released, so a held combo writes SRAM once instead of once every
+ * SAVE_HOLD_FRAMES frames. Unlike the reset latch this does not suppress
+ * input_read: the guest still sees START/SELECT. */
+static bool g_save_latched = false;
 
 void input_init(void) {
     if (g_input_initialized) {
@@ -92,7 +97,10 @@ void input_init(void) {
     g_ctrl.rx = ANALOG_CENTER;
     g_ctrl.ry = ANALOG_CENTER;
     g_ctrl_valid = false;
-    g_quit_hold_frames = 0;
+    g_reset_hold_frames = 0;
+    g_reset_latched = false;
+    g_save_hold_frames = 0;
+    g_save_latched = false;
 
     g_input_initialized = true;
     FZERO_LOG("INFO", "Vita controller input initialized");
@@ -106,10 +114,6 @@ void input_shutdown(void) {
     FZERO_LOG("INFO", "Shutting down Vita controller input");
     g_input_initialized = false;
 }
-
-/* ========================================================================
- * CONTROLLER READING
- * ======================================================================== */
 
 bool input_poll(void) {
     if (!g_input_initialized) {
@@ -130,21 +134,52 @@ bool input_poll(void) {
         g_ctrl.rx = ANALOG_CENTER;
         g_ctrl.ry = ANALOG_CENTER;
         g_ctrl_valid = false;
-        g_quit_hold_frames = 0;
+        g_reset_hold_frames = 0;
+        g_save_hold_frames = 0;
         return false;
     }
 
     g_ctrl = ctrl;
     g_ctrl_valid = true;
 
-    /* Track the quit combo here so the count advances exactly once a frame,
-     * no matter how many times the frame asks about it. */
-    if ((g_ctrl.buttons & SCE_CTRL_START) && (g_ctrl.buttons & SCE_CTRL_SELECT)) {
-        if (g_quit_hold_frames < QUIT_HOLD_FRAMES) {
-            g_quit_hold_frames++;
+    /* Track the reset combo (L + R + START) so the count advances exactly
+     * once a frame. While the latch is set the counter stays at zero: the
+     * player is still holding the combo when the reset fires, and without
+     * the latch the count would climb back to RESET_HOLD_FRAMES and fire a
+     * second reset ~10 frames later. The latch clears only once all three
+     * buttons are released. */
+    bool l_held = (g_ctrl.buttons & SCE_CTRL_LTRIGGER) != 0;
+    bool r_held = (g_ctrl.buttons & SCE_CTRL_RTRIGGER) != 0;
+    bool start_held = (g_ctrl.buttons & SCE_CTRL_START) != 0;
+
+    if (g_reset_latched) {
+        if (!l_held && !r_held && !start_held) {
+            g_reset_latched = false;
+        }
+        g_reset_hold_frames = 0;
+    } else if (l_held && r_held && start_held) {
+        if (g_reset_hold_frames < RESET_HOLD_FRAMES) {
+            g_reset_hold_frames++;
         }
     } else {
-        g_quit_hold_frames = 0;
+        g_reset_hold_frames = 0;
+    }
+
+    /* Track the save combo (START + SELECT) with its own latch, so a held
+     * combo writes SRAM once instead of once every SAVE_HOLD_FRAMES frames.
+     * The latch clears as soon as START or SELECT is released. */
+    bool select_held = (g_ctrl.buttons & SCE_CTRL_SELECT) != 0;
+    if (g_save_latched) {
+        if (!start_held || !select_held) {
+            g_save_latched = false;
+        }
+        g_save_hold_frames = 0;
+    } else if (start_held && select_held) {
+        if (g_save_hold_frames < SAVE_HOLD_FRAMES) {
+            g_save_hold_frames++;
+        }
+    } else {
+        g_save_hold_frames = 0;
     }
 
     return true;
@@ -179,7 +214,9 @@ uint32_t input_read(void) {
     /* Player 1 is always "connected" on a Vita — the pad is the console. */
     uint32_t inputs = SNES_CONTROLLER_P1_ACTIVE;
 
-    if (!g_ctrl_valid) {
+    /* While the reset latch is held the pad still has L/R/START down; report
+     * neutral so those presses don't reach the freshly reset game. */
+    if (!g_ctrl_valid || g_reset_latched) {
         return inputs;
     }
 
@@ -193,12 +230,9 @@ uint32_t input_read(void) {
     if (g_ctrl.buttons & SCE_CTRL_LTRIGGER) inputs |= SNES_INPUT_L;
     if (g_ctrl.buttons & SCE_CTRL_RTRIGGER) inputs |= SNES_INPUT_R;
 
-    /* Start/Select. Withheld while the quit combo is being held so holding
-     * it out doesn't also toggle the pause menu on the way to exiting. */
-    if (g_quit_hold_frames == 0) {
-        if (g_ctrl.buttons & SCE_CTRL_START)  inputs |= SNES_INPUT_START;
-        if (g_ctrl.buttons & SCE_CTRL_SELECT) inputs |= SNES_INPUT_SELECT;
-    }
+    /* Start/Select. */
+    if (g_ctrl.buttons & SCE_CTRL_START)  inputs |= SNES_INPUT_START;
+    if (g_ctrl.buttons & SCE_CTRL_SELECT) inputs |= SNES_INPUT_SELECT;
 
     /* D-Pad. */
     if (g_ctrl.buttons & SCE_CTRL_UP)    inputs |= SNES_INPUT_UP;
@@ -221,6 +255,24 @@ uint32_t input_read(void) {
     return inputs;
 }
 
-bool input_should_quit(void) {
-    return g_quit_hold_frames >= QUIT_HOLD_FRAMES;
+bool input_should_reset(void) {
+    if (g_reset_hold_frames >= RESET_HOLD_FRAMES) {
+        g_reset_hold_frames = 0; /* edge-trigger: fire once per hold */
+        /* Latch until the combo is fully released so the still-held buttons
+         * can neither re-fire the reset nor reach the guest input word. */
+        g_reset_latched = true;
+        return true;
+    }
+    return false;
+}
+
+bool input_should_save(void) {
+    if (g_save_hold_frames >= SAVE_HOLD_FRAMES) {
+        g_save_hold_frames = 0; /* edge-trigger: fire once per hold */
+        /* Latch until the combo is released so the write does not repeat
+         * every SAVE_HOLD_FRAMES frames while the buttons stay held. */
+        g_save_latched = true;
+        return true;
+    }
+    return false;
 }

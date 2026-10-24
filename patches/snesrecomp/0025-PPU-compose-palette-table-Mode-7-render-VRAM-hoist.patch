@@ -1,0 +1,221 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sun, 20 Sep 2026 18:42:08 +0900
+Subject: [PATCH 25/33] PPU: compose palette table, Mode 7 render-VRAM hoist
+
+The compose loop's per-pixel body -- a cgram load, three brightnessMult
+lookups, two shifts and a pack -- is a pure function of the 8-bit palette
+index. There are only 256 distinct answers and the loop was computing them
+~57,000 times a frame. Precompute them into ppu->cgramLut; the loop becomes
+one load and one store.
+
+Rebuilt lazily at first use and invalidated at the only three sites that can
+move its inputs: the $2122 cgram write, the brightness recompute, and
+ppu_saveload. Lazy is what makes it cheap -- F-Zero rewrites its whole palette
+in vblank and those invalidations collapse into one rebuild at the first
+visible line (measured on PC: 1.0 rebuilds/frame, amortised over 224
+scanlines).
+
+Measured on device over 52 consecutive A/B pairs with bg+mode7 drift under
+50 us: compose 3,900 -> 2,110 us/frame, median saving 1,698 (range
+1,678-1,793). ppu_runLine moved 1,718, and spriteEval -- the control -- moved
+8. The saving appears in exactly one phase and in the total, and nowhere else.
+
+Proven pixel-exact on PC before it was trusted: byte-identical over 3,999
+frames spanning 2,520 distinct rendered images. The distinct count is the
+check that matters; a run that never leaves the title screen passes for the
+wrong reason.
+
+Also hoist PpuRenderVram out of the Mode 7 inner loops. The disassembly showed
+GCC re-doing the field load and the null test on every pixel in each of the
+two gathers. Worth is unmeasured and probably small, and it carries no A/B
+global on purpose: with the hoisted value in scope GCC folds both arms of such
+a switch into a single load, so the lever would measure nothing.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/ppu.c | 79 ++++++++++++++++++++++++++++++++++++++++---
+ runner/src/snes/ppu.h | 10 ++++++
+ 2 files changed, 84 insertions(+), 5 deletions(-)
+
+diff --git a/runner/src/snes/ppu.c b/runner/src/snes/ppu.c
+index edb87e7..d3094f5 100644
+--- a/runner/src/snes/ppu.c
++++ b/runner/src/snes/ppu.c
+@@ -49,6 +49,23 @@ int g_ppu_fast_compose = 1;
+ /* Same, for the sprite range-evaluation early-out. Also defined for every
+  * host so PC can prove it pixel-exact. */
+ int g_ppu_fast_sprite_eval = 1;
++/* Same, for the compose loop's palette lookup table (ppu->cgramLut). */
++int g_ppu_fast_cgram_lut = 1;
++
++/* Rebuild the palette -> host-pixel table. This is exactly the body of the
++ * no-math compose loop, run once per palette entry instead of once per pixel.
++ * Only the clip_color_mask == 0x1f case is tabulated; a clipped span takes
++ * the original per-pixel loop. */
++static void PpuBuildCgramLut(Ppu *ppu) {
++  const uint8_t *bm = ppu->brightnessMult;
++  for (int i = 0; i < 0x100; i++) {
++    uint32 color = ppu->cgram[i];
++    ppu->cgramLut[i] = (uint32)bm[color & 0x1f] << 16 |
++                       (uint32)bm[(color >> 5) & 0x1f] << 8 |
++                       (uint32)bm[(color >> 10) & 0x1f];
++  }
++  ppu->cgramLutValid = true;
++}
+ 
+ #ifdef SNESRECOMP_INTERP_PROFILE
+ static double g_ppu_sec_eval_ms = 0;
+@@ -135,6 +152,7 @@ void ppu_saveload(Ppu *ppu, SaveLoadInfo *sli) {
+   sli->func(sli, version, 8);
+   sli->func(sli, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+   sli->func(sli, &ppu->cgram, PPU_SAVESTATE_MEM_SIZE);
++  ppu->cgramLutValid = false;  /* a load rewrites cgram underneath the table */
+ }
+ 
+ void PpuResetWidescreenOamHistory(Ppu *ppu) {
+@@ -753,6 +771,7 @@ void ppu_runLine(Ppu* ppu, int line) {
+         ((i << 3) | (i >> 2)) * ppu_brightness / 15;
+       // Store 31 extra entries to remove the need for clamping to 31.
+       memset(&ppu->brightnessMult[32], ppu->brightnessMult[31], 31);
++      ppu->cgramLutValid = false;
+     }
+ 
+     // evaluate sprites
+@@ -1971,6 +1990,27 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+     (ppu->m7matrix[1] * clippedV & ~63) + (xCenter << 8);
+   uint32 m7startY = (ppu->m7matrix[2] * clippedH & ~63) + (ppu->m7matrix[3] * ry & ~63) +
+     (ppu->m7matrix[3] * clippedV & ~63) + (yCenter << 8);
++  /* Hoisted out of the per-pixel loops. PpuRenderVram is a field load plus a
++   * null test, and the disassembly showed GCC re-doing BOTH on every pixel
++   * (ldr r5,[r4,#3396] / cmp / moveq) in each of the two gathers. The value
++   * cannot change here -- only the host binds renderVram, outside drawing --
++   * so the repeat work is pure loss.
++   *
++   * WHY it was repeated is NOT established. Aliasing is the obvious guess and
++   * is probably wrong: a uint16 store cannot alias a pointer field under the
++   * strict aliasing this builds with. Register pressure fits the evidence
++   * better -- after hoisting, the pointer lives in a STACK SLOT rather than a
++   * register, which is what a compiler does when it has none to spare. Either
++   * way the fix is the same and the removed work is a cmp and a moveq per
++   * gather; do not quote a cause here that nobody measured.
++   *
++   * This one gets NO A/B global, unlike the others. With the hoisted value in
++   * scope GCC folds `flag ? m7vram : PpuRenderVram(ppu)` to a single load and
++   * the switch never reaches the code -- verified in the asm, no reference to
++   * the global outside .data. A lever that cannot restore the slow arm would
++   * measure nothing, so its worth is a bg+mode7 delta across builds. */
++  const uint16_t *const m7vram = PpuRenderVram(ppu);
++#define M7VRAM m7vram
+   for (size_t windex = 0; windex < win.nr; windex++) {
+     if (win.bits & (1 << windex))
+       continue;  // layer is disabled for this window part
+@@ -1993,9 +2033,9 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+             continue;
+           tile = 0;
+         } else {
+-          tile = PpuRenderVram(ppu)[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
++          tile = M7VRAM[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+         }
+-        uint8 pixel = PpuRenderVram(ppu)[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
++        uint8 pixel = M7VRAM[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+         if (pixel) {
+           int i = 0;
+           do dstz[i] = pixel + z; while (++i != w);
+@@ -2008,14 +2048,15 @@ static void PpuDrawBackground_mode7(Ppu *ppu, PpuPixelPrioBufs *dstbuf, uint y,
+             continue;
+           tile = 0;
+         } else {
+-          tile = PpuRenderVram(ppu)[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
++          tile = M7VRAM[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+         }
+-        uint8 pixel = PpuRenderVram(ppu)[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
++        uint8 pixel = M7VRAM[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+         if (pixel)
+           dstz[0] = pixel + z;
+       } while (xpos += dx, ypos += dy, ++dstz != dstz_end);
+     }
+   }
++#undef M7VRAM
+ }
+ 
+ static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
+@@ -2352,6 +2393,9 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+   uint32 hud_world_left = kPpuExtraLeftRight - ppu->extraLeftCur;
+   uint32 hud_world_right = kPpuExtraLeftRight + 256 + ppu->extraRightCur;
+ 
++  if (g_ppu_fast_cgram_lut && !ppu->cgramLutValid)
++    PpuBuildCgramLut(ppu);
++
+   uint32 windex = 0;
+   do {
+     uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
+@@ -2371,6 +2415,20 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+     uint32 fixed_color = ppu->fixedColor;
+     if (math_enabled_cur == 0 || fixed_color == 0 && !PPU_halfColor(ppu) && !rendered_subscreen) {
+       // Math is disabled (or has no effect), so can avoid the per-pixel maths check
++      /* Table-driven span: with no HUD blanking to decide and no clip, every
++       * pixel is cgram -> brightnessMult -> pack, which depends only on the
++       * palette index. That is precomputed in ppu->cgramLut, so the whole
++       * body collapses to one load and one store. A clipped span (mask 0)
++       * falls through to the original loop: it is rare, and the Vita text
++       * segment has ~0 bytes of slack in a PPUPROF build. */
++      if (g_ppu_fast_cgram_lut && !hud_checks_needed &&
++          clip_color_mask == 0x1f) {
++        const uint32 *lut = ppu->cgramLut;
++        const uint16 *src = ppu->bgBuffers[0].data;
++        uint32 i = left;
++        do { dst[0] = lut[src[i] & 0xff]; } while (dst++, ++i < right);
++        continue;
++      }
+       uint32 i = left;
+       do {
+         uint16 pixel = ppu->bgBuffers[0].data[i];
+@@ -2415,7 +2473,17 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+         }
+         if (blank) {
+           dst[0] = 0;
+-        } else {
++          continue;
++        }
++        if (g_ppu_fast_cgram_lut && clip_color_mask == 0x1f &&
++            !(math_enabled_cur & (1 << main_layer))) {
++          /* No math for this layer: identical to the no-math body, so the
++           * same table answers it. `continue` in a do-while runs the comma
++           * expression below, which is the dst++/++i the slow path does. */
++          dst[0] = ppu->cgramLut[pixel & 0xff];
++          continue;
++        }
++        {
+           uint32 color = ppu->cgram[pixel & 0xff], color2;
+           uint32 r = color & clip_color_mask;
+           uint32 g = (color >> 5) & clip_color_mask;
+@@ -3154,6 +3222,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+         ppu->cgramBuffer = val;
+       } else {
+         ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
++        ppu->cgramLutValid = false;
+       }
+       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
+       break;
+diff --git a/runner/src/snes/ppu.h b/runner/src/snes/ppu.h
+index 093c6e0..47edc41 100644
+--- a/runner/src/snes/ppu.h
++++ b/runner/src/snes/ppu.h
+@@ -328,6 +328,16 @@ struct Ppu {
+   uint8_t brightnessMultHalf[32 * 2];
+   uint8_t mosaicModulo[kPpuXPixels];
+ 
++  /* Compose fast path: cgram index -> packed host pixel, at the current
++   * brightness. The compose loop's per-pixel body is a cgram load plus three
++   * brightnessMult lookups and two shifts; all of it depends only on the
++   * palette entry, so it is table-driven instead. Host-only cache, rebuilt
++   * lazily -- invalidated by the two things it depends on (a $2122 cgram
++   * write and a brightness change) and by savestate load. Sits OUTSIDE the
++   * snapshot region: it is derived state, never emulated state. */
++  uint32_t cgramLut[0x100];
++  bool cgramLutValid;
++
+   // Host-only widescreen state; excluded from savestates and cleared by reset.
+   PpuWidescreenLineEnhancer *widescreenLineEnhancer;
+   void *widescreenLineEnhancerContext;

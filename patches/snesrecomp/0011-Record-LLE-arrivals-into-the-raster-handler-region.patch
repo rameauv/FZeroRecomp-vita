@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 11:37:26 +0900
+Subject: [PATCH 11/33] Record LLE arrivals into the raster handler region
+
+The Vita host enters $00:8601 only through the generated alias, so any
+interpreted step arriving in $00:8601-$00:8680 from outside that range came by
+another route. Report the step that jumped there and the M/X/E the arrival
+carries, since the bands require M=8/X=16 and an entry that skips $8601's
+REP #$10 mis-decodes their LDX #imm by one byte.
+
+Vita-only, inside the existing #ifdef VITA step hook.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/interp_bridge.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index ebdaf4e..48eae3e 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -1844,6 +1844,25 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+               if (s_prev_mapped && !_mapped)
+                 interp_bridge_note_offrails_vita(s_prev_pc, s_prev_op, s_prev_sp,
+                                                  pc_before, op);
++              /* Entries into the raster handler region $00:8601-$00:8680.
++               * The host enters it only through bank_00_8601's AOT alias, so
++               * an LLE step arriving here from outside names whatever other
++               * route reaches it -- and carries the width it arrives with,
++               * which is the thing that decodes the bands wrong. */
++              { extern void interp_bridge_note_irq_entry_vita(
++                    uint32_t from_pc, uint8_t from_op, uint32_t pc,
++                    uint16_t sp, uint8_t mf, uint8_t xf, uint8_t e);
++                int _in_irq_region = (pc_before >= 0x008601u &&
++                                      pc_before <= 0x008680u);
++                int _was_in = (s_prev_pc >= 0x008601u &&
++                               s_prev_pc <= 0x008680u);
++                if (_in_irq_region && !_was_in)
++                  interp_bridge_note_irq_entry_vita(s_prev_pc, s_prev_op,
++                                                    pc_before, in.sp,
++                                                    (uint8_t)(in.mf ? 1 : 0),
++                                                    (uint8_t)(in.xf ? 1 : 0),
++                                                    (uint8_t)(in.e ? 1 : 0));
++              }
+               s_prev_pc = pc_before; s_prev_op = op; s_prev_sp = in.sp;
+               s_prev_mapped = _mapped;
+             }

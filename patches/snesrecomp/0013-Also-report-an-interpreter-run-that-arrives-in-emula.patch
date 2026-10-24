@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 11:50:32 +0900
+Subject: [PATCH 13/33] Also report an interpreter run that arrives in
+ emulation mode
+
+Reporting only edges misses the case that matters: the interpreter can be
+handed e=1 through sync_cpu_to_interp and never transition inside the run, so
+there is no edge to catch. Report the first step seen with e set as well,
+distinguished by to_e=2.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/snes/interp_bridge.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 787c17f..841f61a 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -1855,9 +1855,15 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                     uint32_t pc, uint8_t op, uint16_t sp, uint8_t to_e);
+                 static int s_prev_e = -1;
+                 int _e = in.e ? 1 : 0;
++                /* Report a transition, and also the FIRST step seen with e=1
++                 * in each run: the interpreter can arrive already in emulation
++                 * mode (inherited through sync_cpu_to_interp), in which case
++                 * there is no edge to catch inside the run at all. */
+                 if (s_prev_e >= 0 && _e != s_prev_e)
+                   interp_bridge_note_emulation_vita(s_prev_pc, s_prev_op,
+                                                     in.sp, (uint8_t)_e);
++                else if (_e && s_prev_e < 0)
++                  interp_bridge_note_emulation_vita(pc_before, op, in.sp, 2);
+                 s_prev_e = _e;
+               }
+ 

@@ -5,9 +5,8 @@ __pycache__/
 # Local build output.
 /build*/
 
-# Recompiled ROM code. This is a derivative of F-Zero (USA).sfc and MUST NEVER
-# be committed: this repository is public. Regenerate it locally with
-# tools/regenerate.sh from your own legally obtained ROM.
+# Recompiled ROM code. It is a derivative of F-Zero (USA).sfc and must never be
+# published. Regenerate it locally with tools/regenerate.sh.
 /generated/
 
 # Ghidra project (a disassembly of the ROM, so also a derivative) and the
@@ -37,6 +36,12 @@ __pycache__/
 /log.txt
 /docs/log.txt
 
+# Local launcher state (normally written beside the executable).
+/config.ini
+/config.ini.tmp
+/keybinds.ini
+/rom.cfg
+
 # Private inputs and runtime evidence. Never publish these.
 /reference/
 /saves/
@@ -60,18 +65,12 @@ __pycache__/
 *.mmo
 tier2_*.json
 
-# Vita3K emulator loop: a second build tree and the
+# Windows dependency caches.
+/.tools/
+/vcpkg_installed/
+
+# Vita3K emulator loop (.claude/skills/vita3k-run): a second build tree and the
 # log it copies back. Both are artifacts of a run, not source.
 build-vita3k/
 vita3k-log.txt
-
-# Planning notes stay local; only docs describing the shipped build are published.
-/docs/ADR/
-/docs/tickets/
-/docs/IMPLEMENTATION.md
-/HANDOFF.md
-/docs/GLOSSARY.md
-
-# Claude Code files (skills, settings, notes) stay local.
-/.claude/
-CLAUDE.md
+.claude/

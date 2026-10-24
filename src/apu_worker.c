@@ -3,22 +3,21 @@
  *
  * The SPC700 and S-DSP are a physically separate chip: their own crystal,
  * their own 64 KB of SRAM, and four 8-bit latches ($2140-$2143) as the only
- * link to the 5A22. Emulating them on the game thread is what makes them cost
- * 5.7 ms of a 16.6 ms frame here; emulating them on the other core costs the
- * frame nothing but a lock acquisition.
+ * link to the 5A22. On the game thread they cost about 5.7 ms of a 16.6 ms
+ * frame; on another core they cost the frame only a lock acquisition.
  *
- * What this file owns is only the thread and the toggle. The contract -- what
- * the worker may advance to, and why that keeps the emulation deterministic
- * -- lives in common_rtl.c beside the state it guards.
+ * This file owns only the thread and the toggle. The contract (what the
+ * worker may advance to, and why that keeps the emulation deterministic) is
+ * in common_rtl.c beside the state it guards.
  *
- * Runtime toggle, so this can be A/B'd on device the way the GXM renderer,
- * the sprite early-out and the compose hoist were: FZERO_APU_WORKER=0 in the
- * environment disables it, and apu_worker_set() flips it at runtime.
+ * FZERO_APU_WORKER=0 in the environment disables the worker, and
+ * apu_worker_set() switches it at runtime.
  */
 
 #include "apu_worker.h"
 
-#include <SDL.h>
+#define SDL_ENABLE_OLD_NAMES
+#include <SDL3/SDL.h>
 #include <stdlib.h>
 #include <psp2/kernel/threadmgr.h>
 
@@ -47,18 +46,16 @@ static int g_worker_affinity;
 
 static SDL_Thread *g_thread;
 static volatile int g_run;      /* clear to ask the thread to exit */
-static volatile int g_enabled;  /* the A/B toggle */
+static volatile int g_enabled;
 
 static int APUWorkerMain(void *unused) {
     (void)unused;
-    /* Which core this lands on decides whether the change is worth anything,
-     * and SDL's Vita backend picks the mask, not us. Pin to the two user
-     * cores the game thread is least likely to be on, and LOG what actually
-     * happened -- a worker sharing core 0 with the game thread would show up
-     * as "no speedup" and look exactly like a wrong projection. */
+    /* SDL's Vita backend picks the mask, so set it here. Pin to core 1 alone,
+     * so core 2 stays free for other work, and log the result: a worker that
+     * shares core 0 with the game thread gives no speedup. */
     int before = sceKernelGetThreadCpuAffinityMask(0);
     int rc = sceKernelChangeThreadCpuAffinityMask(
-        0, SCE_KERNEL_CPU_MASK_USER_1 | SCE_KERNEL_CPU_MASK_USER_2);
+        0, SCE_KERNEL_CPU_MASK_USER_1);
     int mask = sceKernelGetThreadCpuAffinityMask(0);
     g_worker_affinity = mask;
     FZERO_LOG("INFO",
@@ -88,9 +85,8 @@ bool apu_worker_start(void) {
 
     /* Disjoint masks are what makes "the worker never shares a core with the
      * game thread" a guarantee rather than a hope. Confining only the worker
-     * (USER_1|USER_2) leaves the game thread on USER_ALL, and the scheduler
-     * may put it on core 1 or 2 on top of the worker at any moment; the win
-     * measured on device happened with that still possible. Pin the game
+     * leaves the game thread on USER_ALL, and the scheduler
+     * may put it on core 1 or 2 on top of the worker at any moment. Pin the game
      * thread to core 0 and the intersection is empty, so the kernel cannot
      * co-schedule them however loaded the machine gets.
      *
@@ -118,9 +114,8 @@ bool apu_worker_start(void) {
 
     /* Order matters at both ends of the lifetime: this must run AFTER
      * LoadAndInitSNES, because the worker dereferences g_snes->apu on its
-     * first slice, and BEFORE audio_start only in the sense that both need
-     * the SNES to exist. Opening the audio device before the emulator is
-     * what crashed the first build of the callback rewrite. */
+     * first slice. audio_start has the same requirement: the SNES must
+     * exist before the audio callback can run. */
     RtlApuWorkerEnable(g_enabled);
 
     g_run = 1;
@@ -139,9 +134,8 @@ bool apu_worker_start(void) {
 void apu_worker_stop(void) {
     if (!g_thread) return;
     /* Stop the worker BEFORE anything frees emulator state. Cleanup() frees
-     * the SPC player, which owns the DSP's RAM; the same use-after-free that
-     * the audio thread had is available to this one. Joining here means no
-     * slice can be in flight once this returns. */
+     * the SPC player, which owns the DSP's RAM. Joining here means no slice
+     * can be in flight once this returns. */
     RtlApuWorkerEnable(0);
     g_run = 0;
     SDL_WaitThread(g_thread, NULL);
@@ -156,9 +150,8 @@ void apu_worker_set(bool on) {
 bool apu_worker_enabled(void) { return g_enabled != 0; }
 
 void apu_worker_log_affinity(void) {
-    /* Re-stated periodically because the netlog reaching a session is usually
-     * a TAIL: the startup line that says whether the two masks are disjoint
-     * had been scrolling off before anyone could read it. */
+    /* Logged periodically, because the startup line scrolls out of the
+     * network log. */
     int w = g_worker_affinity;
     FZERO_LOG("INFO", "  cores: game=%#x worker=%#x -- %s",
               (unsigned)g_main_affinity, (unsigned)w,

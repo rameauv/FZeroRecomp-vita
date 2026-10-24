@@ -1,4 +1,5 @@
 #include "fzero_vehicles.h"
+#include "fzero_layers.h"
 #include "fzero_scene.h"
 #include "display_layout.h"
 #include <string.h>
@@ -96,6 +97,7 @@ static bool Reconstruct(FZeroVehicle *car, unsigned id, const uint8_t *ram,
         pixels = Rom(rom, ((8 + model) << 16) | source);
     }
     memset(car->graphics, 0, sizeof(car->graphics));
+    car->graphics_words = half_words;
     for (unsigned row = 0; row < 2; ++row)
         for (unsigned w = 0; w < half_words; ++w)
             car->graphics[row * 256 + w] = Word(pixels + (row * half_words + w) * 2);
@@ -159,6 +161,7 @@ static void PrepareShadows(FZeroVehicles *frame, const uint8_t *ram, const uint8
             int dx = (int16_t)Word(parts + p * 4);
             if (!dx) break;
             unsigned n = frame->shadow_count++;
+            frame->shadow_car[n] = (uint8_t)id;
             int x = car->x + dx;
             unsigned flags = parts[p * 4 + 3];
             frame->shadow_oam[n * 2] = ((unsigned)y & 255) << 8 | ((unsigned)x & 255);
@@ -241,25 +244,87 @@ void FZeroVehiclesPrepare(FZeroVehicles *frame, const uint8_t *ram,
     frame->ready = true;
 }
 
+/* ADDITIVE mode (g_fzero_wide_keepoam): keep the game's own sprite list and
+ * place the reconstructed cars in slots it is not using, instead of wiping it.
+ *
+ * The wipe below exists because the side pass "owns its OAM list" -- but every
+ * extension this pass makes is supposed to be SIDE-LOCAL, and a wipe is not:
+ * it removes the HUD from the centre as well. The reconstruction only ever
+ * covers cars the game has parked off-screen (see Prepare: x < -32 or x >= 288),
+ * so those sprites land in the margins by construction and adding them cannot
+ * touch the centre. It needs 8 slots; the game leaves far more than that
+ * parked or unused.
+ *
+ * Same test for "not in use" as ExtendVehicleSprites: parked at the game's
+ * 0x8080 sentinel, or an active-group piece with Y == 0. */
+static bool SlotFree(const Ppu *copy, unsigned slot) {
+    unsigned index = slot * 2;
+    unsigned high = (copy->highOam[index >> 3] >> (index & 7)) & 3;
+    bool parked = copy->oam[index] == 0x8080 && (high & 1);
+    bool unused = slot < 116 && (copy->oam[index] >> 8) == 0;
+    return parked || unused;
+}
+
 void FZeroVehiclesApply(const FZeroVehicles *frame, Ppu *copy) {
     uint8_t hints[16] = {0};
+    const bool keep = g_fzero_wide_keepoam != 0;
     /* The side pass owns its OAM list. Reordering or adding its entries cannot
      * alter the authentic centre or consume its hardware sprite budget. */
-    memset(copy->oam, 0, sizeof(copy->oam));
-    memset(copy->highOam, 0x55, sizeof(copy->highOam));
+    if (!keep) {
+        memset(copy->oam, 0, sizeof(copy->oam));
+        memset(copy->highOam, 0x55, sizeof(copy->highOam));
+    }
     unsigned order[6], count = 0;
     for (unsigned id = 0; id < 6; ++id) if (frame->car[id].visible) {
+        /* ADDITIVE mode adds only what the game is NOT drawing. `visible`
+         * includes cars the game has in its own OAM (the `flags & 8` branch in
+         * Prepare); `added` marks the ones reconstructed because the game
+         * parked them off-screen. Replacing the list made that distinction
+         * irrelevant -- adding to it makes it the whole point, or every
+         * on-screen car is drawn twice. */
+        if (keep && !frame->car[id].added) continue;
         unsigned at = count++;
         while (at && frame->car[order[at - 1]].ground_y <= frame->car[id].ground_y) {
             order[at] = order[at - 1]; --at;
         }
         order[at] = id;
     }
+    /* In additive mode the game's own vehicle sprites stay in the list, and a
+     * car at x >= 256 is in the ambiguous decode band. Without a right-margin
+     * hint strict decoding wraps it to x - 512, so the car body disappears from
+     * the margin while its reconstructed shadow (which is hinted) stays. Give
+     * the game's in-use vehicle slots the same hint ExtendVehicleSprites gives
+     * them: slot >= 68, not parked, not unused. */
+    if (keep)
+        for (unsigned q = 68; q < 128; ++q)
+            if (!SlotFree(copy, q)) hints[q / 8] |= 1u << (q & 7);
     unsigned slot = 0;
+    if (keep) while (slot < 128 && !SlotFree(copy, slot)) ++slot;
     for (unsigned c = 0; c < count; ++c) {
         const FZeroVehicle *car = &frame->car[order[c]];
+        /* Only the words the pose uses, per tile row. The two rows are 256
+         * words apart and the cars' artwork slots share them, so copying the
+         * whole 512-word buffer wrote zeros over the neighbouring slots --
+         * the player's included, which one render then showed in the
+         * centre. */
         if (car->added)
-            memcpy(copy->vram + car->graphics_address, car->graphics, sizeof(car->graphics));
+            for (unsigned row = 0; row < 2; ++row)
+                memcpy(copy->vram + ((car->graphics_address + row * 256) & 0x7fff),
+                       car->graphics + row * 256,
+                       car->graphics_words * sizeof(car->graphics[0]));
+        /* Place a car whole or not at all. With the list wiped there are always
+         * 128 free slots and this cannot fail; with the list kept there are
+         * about 62, and a car cut off mid-way is half a car on screen. */
+        unsigned needed = 0, available = 0;
+        for (unsigned p = 0; p < car->count; ++p) {
+            unsigned high = (car->high >> (p * 2)) & 3;
+            unsigned position = car->oam[p * 2];
+            if (!((!order[c] && !(position >> 8)) || (position == 0x8080 && (high & 1))))
+                ++needed;
+        }
+        for (unsigned q = slot; q < 128; ++q)
+            if (!keep || SlotFree(copy, q)) ++available;
+        if (needed > available) continue;
         for (unsigned p = 0; p < car->count; ++p) {
             unsigned high = (car->high >> (p * 2)) & 3;
             unsigned position = car->oam[p * 2];
@@ -270,18 +335,24 @@ void FZeroVehiclesApply(const FZeroVehicles *frame, Ppu *copy) {
             copy->highOam[slot / 4] = (copy->highOam[slot / 4] & ~(3u << shift)) | high << shift;
             hints[slot / 8] |= 1u << (slot & 7);
             ++slot;
+            if (keep) while (slot < 128 && !SlotFree(copy, slot)) ++slot;
         }
     }
-    for (unsigned p = 0; p < frame->shadow_count; ++p, ++slot) {
+    for (unsigned p = 0; p < frame->shadow_count && slot < 128; ++p) {
+        /* Additive: the game draws the shadows of the cars it draws. */
+        if (keep && !frame->car[frame->shadow_car[p]].added) continue;
         copy->oam[slot * 2] = frame->shadow_oam[p * 2];
         copy->oam[slot * 2 + 1] = frame->shadow_oam[p * 2 + 1];
         unsigned shift = (slot & 3) * 2;
         unsigned high = (frame->shadow_high[p / 4] >> ((p & 3) * 2)) & 3;
         copy->highOam[slot / 4] = (copy->highOam[slot / 4] & ~(3u << shift)) | high << shift;
         hints[slot / 8] |= 1u << (slot & 7);
+        ++slot;
+        if (keep) while (slot < 128 && !SlotFree(copy, slot)) ++slot;
     }
-    copy->oamaddl = copy->oamaddh = 0;
+    if (!keep) copy->oamaddl = copy->oamaddh = 0;
     PpuWsSetOamLeftHints(copy, hints);
     PpuWsSetOamRightHints(copy, hints);
-    copy->renderFlags |= kPpuRenderFlags_NoSpriteLimits;
+    if (g_fzero_wide_nolimits)
+        copy->renderFlags |= kPpuRenderFlags_NoSpriteLimits;
 }

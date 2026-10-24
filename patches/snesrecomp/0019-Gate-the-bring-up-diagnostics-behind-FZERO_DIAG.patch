@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: valentin rameau <valentin.rameau@outlook.fr>
+Date: Sat, 19 Sep 2026 20:37:37 +0900
+Subject: [PATCH 19/33] Gate the bring-up diagnostics behind FZERO_DIAG
+
+The probes are worth keeping, but some of their cost is real rather than
+cosmetic: the interpreter step ring takes a store on EVERY interpreted step
+-- the hottest loop in the runtime -- plus 96KB of .bss.
+
+Gated by FZERO_DIAG (set from the host's cmake option, default off):
+  - the step ring, its per-step store, and its globals. Its accessor
+    interp_bridge_recent_step() now reports "no history" when the ring is not
+    compiled in, rather than returning stale data.
+  - the paired-call bounce-imbalance probe and its globals.
+  - the APU-port read probe in snes.c.
+  - the four host hook sites, now #if defined(VITA) && FZERO_DIAG, so the
+    hooks and the host-side definitions they call disappear together.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ runner/src/common_rtl.c         |  4 ++--
+ runner/src/cpu_state.c          |  2 +-
+ runner/src/snes/interp_bridge.c | 20 +++++++++++++++++++-
+ runner/src/snes/snes.c          |  4 ++++
+ 4 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/runner/src/common_rtl.c b/runner/src/common_rtl.c
+index 15ffccc..bb0d55d 100644
+--- a/runner/src/common_rtl.c
++++ b/runner/src/common_rtl.c
+@@ -1400,7 +1400,7 @@ void WriteReg(uint16 reg, uint8 value) {
+     cart_sync_coprocessors(g_snes->cart, g_cpu.master_cycles);
+     cart_write(g_snes->cart, 0, reg, value);
+   } else if (reg >= 0x2100 && reg < 0x2140) {
+-#ifdef VITA
++#if defined(VITA) && FZERO_DIAG
+     /* Vita bring-up probe: trace the display registers that decide whether a
+      * frame can show anything (INIDISP brightness / forced blank, TM/TS). */
+     { extern void FZeroLogPpuRegWrite(uint16 reg, uint8 value, int line);
+@@ -1420,7 +1420,7 @@ void WriteReg(uint16 reg, uint8 value) {
+   } else if (reg >= 0x2180 && reg < 0x2184) {
+     snes_writeBBus(g_snes, reg & 0xff, value);
+   } else if (reg >= 0x4200 && reg < 0x4220) {
+-#ifdef VITA
++#if defined(VITA) && FZERO_DIAG
+     /* Vita bring-up probe: the raster split chain is armed through $4200
+      * (NMI/IRQ enable) and $4207-$420A (H/V timer targets). Trace those to
+      * see whether the chain is armed at all, and at which line. */
+diff --git a/runner/src/cpu_state.c b/runner/src/cpu_state.c
+index 62c4117..d099de4 100644
+--- a/runner/src/cpu_state.c
++++ b/runner/src/cpu_state.c
+@@ -155,7 +155,7 @@ static void wlog_addr_lazy(void) {
+ }
+ 
+ 
+-#ifdef VITA
++#if defined(VITA) && FZERO_DIAG
+ /* Vita stack-corruption watch. The wlog facility above logs to a FILE, which
+  * this host has no useful path for; route the same information to the network
+  * log instead. Reported through the host so the window and the address are the
+diff --git a/runner/src/snes/interp_bridge.c b/runner/src/snes/interp_bridge.c
+index 519786d..0e9d63c 100644
+--- a/runner/src/snes/interp_bridge.c
++++ b/runner/src/snes/interp_bridge.c
+@@ -773,9 +773,11 @@ void interp_bridge_set_lle_bounce_exclusions(const uint32 *targets,
+  * (see the repair at the bounce site). Nonzero means generated bodies are
+  * returning NORMAL without consuming their guest return frame. */
+ unsigned long g_interp_paired_frame_repairs = 0;
++#if FZERO_DIAG
+ struct InterpRepairLog { uint32_t target, site; int air; uint16_t sp_pre, sp_post; uint8_t fs; int sched_depth, in_sched, owner_depth; };
+ struct InterpRepairLog g_interp_repair_log[8];
+ unsigned long g_interp_bounce_imbalances = 0;
++#endif
+ unsigned long g_interp_frame_left_for_ancestor = 0;
+ static int s_scheduler_aot_policy = -1;
+ void interp_bridge_set_scheduler_aot_policy(int enabled) {
+@@ -875,16 +877,25 @@ static void itrace_dump(uint32_t entry, const ITraceEnt *head, int nhead,
+  * stderr dump here: upstream retired the g_interp_recent_dump_hook halt path
+  * in favour of the function-local ring, and the host that needs this one
+  * (the Vita port) has no usable stderr and logs over the network instead. */
++#if FZERO_DIAG
+ #define ITRACE_RECENT_LEN 8192
+ typedef struct { uint32_t pc; int32_t frame; uint16_t sp; uint8_t op; uint8_t pad; } ITraceRecentEnt;
+ static ITraceRecentEnt g_itrace_recent[ITRACE_RECENT_LEN];
+ static uint64_t g_itrace_recent_n = 0;
++#endif
+ 
+ /* Programmatic read of the recent-step ring, for hosts with no usable stderr
+  * (the Vita port logs over the network). `back` is 1-based and counts
+  * backwards from the newest step. Returns 0 when `back` is out of range. */
+ int interp_bridge_recent_step(int back, uint32_t *pc, uint8_t *op,
+                               uint16_t *sp, int32_t *frame) {
++#if !FZERO_DIAG
++    /* Ring not compiled in (FZERO_DIAG off): it costs a store on EVERY
++     * interpreted step plus 96KB of .bss, so it is not carried in a shipping
++     * build. Report "no history" rather than stale data. */
++    (void)back; (void)pc; (void)op; (void)sp; (void)frame;
++    return 0;
++#else
+     uint64_t have = g_itrace_recent_n < ITRACE_RECENT_LEN
+                         ? g_itrace_recent_n : ITRACE_RECENT_LEN;
+     if (back < 1 || (uint64_t)back > have) return 0;
+@@ -895,6 +906,7 @@ int interp_bridge_recent_step(int back, uint32_t *pc, uint8_t *op,
+     if (sp) *sp = e->sp;
+     if (frame) *frame = e->frame;
+     return 1;
++#endif
+ }
+ 
+ /* Tier-2 coverage table (definitions below, § gap manifest): shared by the
+@@ -1828,12 +1840,16 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+             if (itn < 8) head[itn] = _e;
+             if (trace) ring[itn & 255] = _e;
+             itn++;
++#if FZERO_DIAG
++            /* One store per interpreted step -- the hottest loop in the
++             * runtime -- so this is compiled out unless diagnostics are on. */
+             extern int snes_frame_counter;
+             ITraceRecentEnt *_g =
+                 &g_itrace_recent[g_itrace_recent_n++ & (ITRACE_RECENT_LEN - 1)];
+             _g->pc = pc_before; _g->frame = snes_frame_counter;
+             _g->sp = in.sp; _g->op = op; _g->pad = 0;
+-#ifdef VITA
++#endif
++#if defined(VITA) && FZERO_DIAG
+             /* Off-rails entry capture. A wedge in unmapped space runs far
+              * longer than the 8192-entry ring, so by bail time the ring holds
+              * only the wedge loop and the transition is long gone. Latch the
+@@ -2253,6 +2269,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                  * any of the exit branches below, so no path can hide it.
+                  * Two successive guesses at which branch leaks the return
+                  * frame both produced 0 hits, so measure instead of infer. */
++#if FZERO_DIAG
+                 if (in.sp == _sp_pre && g_interp_bounce_imbalances < 8) {
+                     struct InterpRepairLog *e =
+                         &g_interp_repair_log[g_interp_bounce_imbalances];
+@@ -2264,6 +2281,7 @@ static int _interp_run_core(CpuState *cpu, uint32_t entry_pc24,
+                     e->owner_depth = s_interp_bounce_owner_depth;
+                     g_interp_bounce_imbalances++;
+                 }
++#endif
+                 const uint32_t ret =
+                     (pc_before + (uint32_t)call_len +
+                      (uint32_t)cpu_dispatch_inline_arg_bytes(target)) & 0xFFFFFF;
+diff --git a/runner/src/snes/snes.c b/runner/src/snes/snes.c
+index d086028..8ff0b0a 100644
+--- a/runner/src/snes/snes.c
++++ b/runner/src/snes/snes.c
+@@ -252,6 +252,7 @@ void snes_catchup_stats(uint64_t *calls, uint64_t *cycles) {
+ }
+ 
+ 
++#if FZERO_DIAG
+ /* TEMPORARY PROBE (Vita-vs-PC APU handshake divergence): capture the first 8
+  * APU-port reads with the guest timestamp that drives apu_runToGuestCycle.
+  * F-Zero's boot spins on CMP $2140 waiting for the SPC IPL to answer $BBAA;
+@@ -262,6 +263,7 @@ struct ApuPortProbe g_apu_port_probe[8];
+ unsigned g_apu_port_probe_n = 0;
+ unsigned long g_apu_port_reads_total = 0;
+ struct ApuPortProbe g_apu_port_last;
++#endif
+ 
+ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
+   if(adr < 0x40) {
+@@ -274,6 +276,7 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
+     rtl_sync_apu_to_cpu_locked();
+     uint8_t v = snes->apu->outPorts[adr & 0x3];
+     v = rtl_apu_port_observers_read(0x2100 + adr, v);
++#if FZERO_DIAG
+       g_apu_port_reads_total++;
+       { extern int snes_frame_counter;
+         extern uint64_t rtl_apu_guest_cycle_probe(void);
+@@ -297,6 +300,7 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
+         e->port_clock = (unsigned long long)snes->apu->portClock;
+         e->frame = snes_frame_counter;
+       }
++#endif
+     audio_trace_on_cpu_port_read((uint8_t)(adr & 0x3), v);
+     RtlApuUnlock();
+     return v;
